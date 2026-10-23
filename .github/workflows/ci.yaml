@@ -1,0 +1,33 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# CPU only, under the Triton interpreter. No benchmark jobs: published numbers come
+# only from result JSON produced on GPU machines.
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10
+        with:
+          version: "0.13.5"
+          python-version: "3.12"
+      - run: uv sync --locked --extra cpu --extra bench
+      - run: make lint
+
+  test:
+    runs-on: ubuntu-latest
+    env:
+      TRITON_INTERPRET: "1"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10
+        with:
+          version: "0.13.5"
+          python-version: "3.12"
+      - run: uv sync --locked --extra cpu --extra bench
+      - run: make test

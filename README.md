@@ -47,6 +47,26 @@ project. Measured results will replace this section.
 - Each benchmark reports percent of the roofline as well as speedup over a
   baseline.
 
+## Development
+
+Triton runs on Linux only. On macOS, open the repository in the devcontainer
+(`.devcontainer/`).
+
+```bash
+make install     # CPU torch, for the devcontainer and CI
+make test        # CPU tests under the Triton interpreter
+make lint        # ruff and mypy
+```
+
+On a GPU machine:
+
+```bash
+make install-cu130                      # or install-cu126 for older drivers
+uv run python scripts/env_report.py     # GPU, versions, Nsight counter access
+make test-gpu
+make bench-smoke                        # writes results/<gpu>/smoke/<timestamp>.json
+```
+
 ## Prior work
 
 Cascade attention exists in [FlashInfer](https://github.com/flashinfer-ai/flashinfer)

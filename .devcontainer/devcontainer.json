@@ -1,0 +1,17 @@
+{
+  "name": "kvkernels",
+  "build": {
+    "dockerfile": "Dockerfile",
+    "context": "."
+  },
+  "initializeCommand": "bash scripts/export_host_cas.sh",
+  "postCreateCommand": "git config --global --add safe.directory ${containerWorkspaceFolder} && make install",
+  "customizations": {
+    "vscode": {
+      "extensions": ["ms-python.python", "charliermarsh.ruff"],
+      "settings": {
+        "python.defaultInterpreterPath": "/opt/venv/bin/python"
+      }
+    }
+  }
+}

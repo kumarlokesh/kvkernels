@@ -1,0 +1,89 @@
+[project]
+name = "kvkernels"
+version = "0.0.0"
+description = "Triton kernels for paged KV-cache movement and shared-prefix decode attention"
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+requires-python = ">=3.11"
+# torch and Triton are pinned exactly so that results stay comparable across runs.
+# Triton publishes Linux wheels only.
+dependencies = [
+    "numpy>=1.26",
+    "triton==3.8.0; sys_platform == 'linux'",
+]
+
+[project.optional-dependencies]
+# Pick exactly one torch build: cpu (devcontainer, CI, macOS) or a CUDA build (GPU machines).
+cpu = ["torch==2.14.1"]
+cu126 = ["torch==2.14.1; sys_platform == 'linux'"]
+cu130 = ["torch==2.14.1; sys_platform == 'linux'"]
+bench = ["matplotlib>=3.8", "pandas>=2.1"]
+# baselines: flashinfer-python, added and pinned together with the attention benchmarks.
+
+[dependency-groups]
+dev = ["mypy>=1.11", "pytest>=8", "ruff>=0.6"]
+
+[build-system]
+requires = ["uv_build>=0.13,<0.14"]
+build-backend = "uv_build"
+
+[tool.uv]
+conflicts = [[{ extra = "cpu" }, { extra = "cu126" }, { extra = "cu130" }]]
+
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-cpu", extra = "cpu" },
+    { index = "pytorch-cu126", extra = "cu126" },
+    { index = "pytorch-cu130", extra = "cu130" },
+]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM", "RUF"]
+
+[tool.ruff.lint.per-file-ignores]
+# Verbatim tool output used as test input.
+"tests/test_timer_check.py" = ["E501"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+files = ["src", "bench", "scripts", "tests"]
+mypy_path = ["src", "."]
+explicit_package_bases = true
+
+[[tool.mypy.overrides]]
+module = ["triton", "triton.*", "matplotlib", "matplotlib.*"]
+ignore_missing_imports = true
+
+# Tests and @triton.jit kernels use Triton's untyped decorator.
+[[tool.mypy.overrides]]
+module = ["tests.*"]
+disallow_untyped_decorators = false
+disallow_untyped_defs = false
+disallow_incomplete_defs = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-ra --strict-markers"
+markers = ["gpu: needs a CUDA GPU; skipped in CI and the devcontainer"]

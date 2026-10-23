@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+build/
+dist/
+
+# Tool caches
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+
+# Kernel IR dumps (scripts/dump_kernel_ir.py)
+dumps/
+
+# Certificate authorities exported from the host for the devcontainer
+.devcontainer/extra-ca/*.pem
+.devcontainer/extra-ca/*.crt
+
+# macOS
+.DS_Store
