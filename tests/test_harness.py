@@ -24,7 +24,7 @@ SPEC = GPUSpec(
     l2_bytes=50 << 20,
     smem_per_sm_bytes=228 << 10,
     num_sms=100,
-    source_url="https://example.invalid/fake",
+    sources=("https://example.invalid/fake",),
 )
 
 
