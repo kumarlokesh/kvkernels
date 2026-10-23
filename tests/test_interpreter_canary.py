@@ -39,8 +39,12 @@ def _dot_error(dtype: Any, n: int = 16) -> float:
     return float((c - a.float() @ b.float()).abs().max())
 
 
-def test_fp16_dot_is_exact_under_interpreter() -> None:
-    assert _dot_error(torch.float16) == 0.0
+def test_fp16_dot_is_correct_under_interpreter() -> None:
+    # Both sides accumulate in fp32, but NumPy's and torch's CPU kernels can round
+    # differently depending on the instructions the CPU offers: exact on aarch64,
+    # 1.4e-6 apart on GitHub's x86_64 runners. This checks fp32 rounding error,
+    # far below the bf16 error checked below.
+    assert _dot_error(torch.float16) < 1e-4
 
 
 def test_bf16_dot_is_still_wrong_under_interpreter() -> None:
