@@ -69,9 +69,11 @@ make bench-smoke                        # writes results/<gpu>/smoke/<timestamp>
 
 ## Prior work
 
-Cascade attention exists in [FlashInfer](https://github.com/flashinfer-ai/flashinfer)
-and vLLM, and the decomposition is described in the Hydragen paper
-([arXiv:2402.05099](https://arxiv.org/abs/2402.05099)). kvkernels implements it in
+Cascade attention is available in [FlashInfer](https://github.com/flashinfer-ai/flashinfer),
+and the decomposition is described in the Hydragen paper
+([arXiv:2402.05099](https://arxiv.org/abs/2402.05099)). vLLM had an opt-in cascade
+path and removed it in October 2026
+([#61126](https://github.com/vllm-project/vllm/pull/61126)). kvkernels implements it in
 Triton on the KV layouts SGLang and vLLM use, and measures it against the roofline.
 
 ## License
