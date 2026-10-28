@@ -16,8 +16,10 @@ dependencies = [
 [project.optional-dependencies]
 # Pick exactly one torch build: cpu (devcontainer, CI, macOS) or a CUDA build (GPU machines).
 cpu = ["torch==2.14.1"]
-cu126 = ["torch==2.14.1; sys_platform == 'linux'"]
-cu130 = ["torch==2.14.1; sys_platform == 'linux'"]
+# cuda-bindings reaches the CUDA driver API for the batched-DMA benchmark baseline;
+# its major version matches the torch build's CUDA.
+cu126 = ["torch==2.14.1; sys_platform == 'linux'", "cuda-bindings==12.9.10; sys_platform == 'linux'"]
+cu130 = ["torch==2.14.1; sys_platform == 'linux'", "cuda-bindings==13.4.4; sys_platform == 'linux'"]
 bench = ["matplotlib>=3.8", "pandas>=2.1"]
 # baselines: flashinfer-python, added and pinned together with the attention benchmarks.
 
@@ -56,6 +58,8 @@ explicit = true
 [tool.ruff]
 line-length = 100
 target-version = "py311"
+# Copied from other projects and kept byte for byte; see each file's header.
+extend-exclude = ["bench/baselines/vllm/swap_blocks_triton.py"]
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "UP", "B", "SIM", "RUF"]
@@ -70,10 +74,21 @@ strict = true
 files = ["src", "bench", "scripts", "tests"]
 mypy_path = ["src", "."]
 explicit_package_bases = true
+exclude = ["bench/baselines/vllm/swap_blocks_triton\\.py"]
 
 [[tool.mypy.overrides]]
-module = ["triton", "triton.*", "matplotlib", "matplotlib.*"]
+module = ["triton", "triton.*", "matplotlib", "matplotlib.*", "cuda", "cuda.*"]
 ignore_missing_imports = true
+
+# The copied vLLM kernel is not type-checked; see its header.
+[[tool.mypy.overrides]]
+module = ["bench.baselines.vllm.swap_blocks_triton"]
+follow_imports = "skip"
+
+# @triton.jit kernels use Triton's untyped decorator.
+[[tool.mypy.overrides]]
+module = ["kvkernels.ops.*"]
+disallow_untyped_decorators = false
 
 # Tests and @triton.jit kernels use Triton's untyped decorator.
 [[tool.mypy.overrides]]
