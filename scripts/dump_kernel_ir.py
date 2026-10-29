@@ -207,6 +207,9 @@ def load_examples(target: str) -> list[Example]:
     module_name, sep, function_name = target.partition(":")
     if not sep:
         raise ValueError(f"expected MODULE:FUNCTION, got {target!r}")
+    root = str(Path.cwd())
+    if root not in sys.path:
+        sys.path.insert(0, root)
     examples = getattr(importlib.import_module(module_name), function_name)()
     return list(examples)
 
