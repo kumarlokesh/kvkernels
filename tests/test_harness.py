@@ -175,3 +175,10 @@ def test_do_bench_returns_enough_samples_on_gpu() -> None:
 
     times = harness.timed_samples(copy, harness.do_bench_samples)
     assert len(times) >= harness.MIN_SAMPLES
+
+
+def test_suite_module_maps_experiment_suites_next_to_their_kernel() -> None:
+    from bench.harness import suite_module
+
+    assert suite_module("smoke") == "bench.suites.smoke"
+    assert suite_module("experiments-matmul") == "experiments.matmul.bench_suite"

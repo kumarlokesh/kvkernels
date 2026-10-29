@@ -2,7 +2,8 @@
 
 Usage: ``python -m bench.harness --suite <name> [--filter key=value ...]``
 
-A suite is a module ``bench/suites/<name>.py`` with ``cases() -> Iterable[Case]``.
+A suite is a module ``bench/suites/<name>.py`` with ``cases() -> Iterable[Case]``;
+a suite named ``experiments-<name>`` is ``experiments/<name>/bench_suite.py``.
 For each case, the harness checks every implementation against the first one
 listed (the reference), then times each one with a cold L2 and records median,
 p10 and p90 with derived metrics.
@@ -302,8 +303,22 @@ def measure_copy_peak(timer: Timer = do_bench_samples) -> float:
     return 2 * PROBE_BYTES / (timing.median_ms * 1e-3) / 1e9
 
 
+EXPERIMENTS_PREFIX = "experiments-"
+
+
+def suite_module(suite: str) -> str:
+    """Module that defines a suite.
+
+    A suite named experiments-<name> lives next to its kernel, in
+    experiments/<name>/bench_suite.py; every other suite in bench/suites/<name>.py.
+    """
+    if suite.startswith(EXPERIMENTS_PREFIX):
+        return f"experiments.{suite.removeprefix(EXPERIMENTS_PREFIX)}.bench_suite"
+    return f"bench.suites.{suite}"
+
+
 def load_cases(suite: str) -> list[Case]:
-    module = importlib.import_module(f"bench.suites.{suite}")
+    module = importlib.import_module(suite_module(suite))
     return list(module.cases())
 
 

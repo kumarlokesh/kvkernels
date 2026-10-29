@@ -71,7 +71,7 @@ select = ["E", "F", "W", "I", "UP", "B", "SIM", "RUF"]
 [tool.mypy]
 python_version = "3.11"
 strict = true
-files = ["src", "bench", "scripts", "tests"]
+files = ["src", "bench", "scripts", "tests", "experiments"]
 mypy_path = ["src", "."]
 explicit_package_bases = true
 exclude = ["bench/baselines/vllm/swap_blocks_triton\\.py"]
@@ -79,6 +79,16 @@ exclude = ["bench/baselines/vllm/swap_blocks_triton\\.py"]
 [[tool.mypy.overrides]]
 module = ["triton", "triton.*", "matplotlib", "matplotlib.*", "cuda", "cuda.*"]
 ignore_missing_imports = true
+
+# Experiment kernels and their tests use Triton's untyped decorator and pytest fixtures.
+[[tool.mypy.overrides]]
+module = ["experiments.*"]
+disallow_untyped_decorators = false
+
+[[tool.mypy.overrides]]
+module = ["experiments.*.test_kernel"]
+disallow_untyped_defs = false
+disallow_incomplete_defs = false
 
 # The copied vLLM kernel is not type-checked; see its header.
 [[tool.mypy.overrides]]
@@ -98,7 +108,7 @@ disallow_untyped_defs = false
 disallow_incomplete_defs = false
 
 [tool.pytest.ini_options]
-testpaths = ["tests"]
+testpaths = ["tests", "experiments"]
 pythonpath = ["."]
 addopts = "-ra --strict-markers"
 markers = ["gpu: needs a CUDA GPU; skipped in CI and the devcontainer"]
