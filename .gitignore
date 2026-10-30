@@ -20,3 +20,6 @@ dumps/
 
 # macOS
 .DS_Store
+
+# Downloaded GPU session output (scripts/kaggle_session.py)
+gpu-sessions/

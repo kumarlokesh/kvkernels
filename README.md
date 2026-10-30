@@ -67,6 +67,23 @@ make test-gpu
 make bench-smoke                        # writes results/<gpu>/smoke/<timestamp>.json
 ```
 
+Every GPU step, in order, with a log each (results are written only after the
+GPU tests pass):
+
+```bash
+uv run python scripts/gpu_session.py run --out session/
+```
+
+On a free Kaggle GPU (T4 or L4), from a development machine, with the Kaggle CLI
+and an API token:
+
+```bash
+python scripts/kaggle_session.py push --user <kaggle-name> --accelerator NvidiaL4
+python scripts/kaggle_session.py status --user <kaggle-name>
+python scripts/kaggle_session.py fetch --user <kaggle-name>
+python scripts/gpu_session.py collect gpu-sessions/kaggle/<time>/session
+```
+
 ## Prior work
 
 Cascade attention is available in [FlashInfer](https://github.com/flashinfer-ai/flashinfer),

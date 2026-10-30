@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from collections.abc import Iterator
 from typing import Any
 
@@ -7,7 +8,11 @@ import pytest
 
 
 def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
-    """Skip gpu-marked tests when no CUDA device is visible."""
+    """Skip gpu-marked tests when no CUDA device is visible.
+
+    With KVKERNELS_REQUIRE_GPU=1 (set by scripts/gpu_session.py), a missing
+    device is an error instead, so a GPU session cannot pass by skipping.
+    """
     try:
         import torch
 
@@ -16,6 +21,8 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
         has_cuda = False
     if has_cuda:
         return
+    if os.environ.get("KVKERNELS_REQUIRE_GPU") == "1":
+        raise pytest.UsageError("KVKERNELS_REQUIRE_GPU=1 but torch sees no CUDA device")
     skip = pytest.mark.skip(reason="needs a CUDA GPU")
     for item in items:
         if "gpu" in item.keywords:
