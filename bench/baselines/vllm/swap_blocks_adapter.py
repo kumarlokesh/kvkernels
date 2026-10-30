@@ -3,7 +3,7 @@
 The copied file imports two vLLM modules. ``vllm.triton_utils`` only re-exports
 ``triton`` and ``triton.language``. ``vllm._custom_ops`` holds vLLM's C++ copy,
 which the file's own launcher calls for batches under 16 jobs; this adapter
-never calls that launcher. Stand-ins for both are registered before the import.
+never calls that launcher. stand_ins.py registers both before the import.
 
 The kernel copies a list of jobs, each a (source address, destination address,
 size in bytes) triple. A gather becomes one job per id:
@@ -18,37 +18,14 @@ size rounded up to a power of two, at most 8 KiB.
 
 from __future__ import annotations
 
-import sys
-import types
-from typing import Any
-
 import torch
 import triton
-import triton.language as tl
+
+from bench.baselines.vllm import stand_ins
 
 # vLLM's caller uses the kernel only when every size is a multiple of 8 bytes.
 WORD_BYTES = 8
 MAX_CHUNK_BYTES = 8192
-
-
-def _install_stand_ins() -> None:
-    if "vllm" in sys.modules:
-        return
-
-    def unavailable(*args: Any, **kwargs: Any) -> None:
-        raise RuntimeError("vLLM's C++ copy is not available outside vLLM")
-
-    vllm = types.ModuleType("vllm")
-    custom_ops = types.ModuleType("vllm._custom_ops")
-    triton_utils = types.ModuleType("vllm.triton_utils")
-    custom_ops.swap_blocks_batch = unavailable  # type: ignore[attr-defined]
-    triton_utils.triton = triton  # type: ignore[attr-defined]
-    triton_utils.tl = tl  # type: ignore[attr-defined]
-    vllm._custom_ops = custom_ops  # type: ignore[attr-defined]
-    vllm.triton_utils = triton_utils  # type: ignore[attr-defined]
-    sys.modules.update(
-        {"vllm": vllm, "vllm._custom_ops": custom_ops, "vllm.triton_utils": triton_utils}
-    )
 
 
 def supports(block_bytes: int, stride_bytes: int) -> bool:
@@ -76,7 +53,7 @@ def chunk_bytes(block_bytes: int) -> int:
 
 def copy_jobs(src: torch.Tensor, dst: torch.Tensor, sizes: torch.Tensor, chunk: int) -> None:
     """Launch the copied kernel with one program per job."""
-    _install_stand_ins()
+    stand_ins.install()
     from bench.baselines.vllm import swap_blocks_triton
 
     n = src.numel()

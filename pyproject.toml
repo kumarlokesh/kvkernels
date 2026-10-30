@@ -61,7 +61,11 @@ explicit = true
 line-length = 100
 target-version = "py311"
 # Copied from other projects and kept byte for byte; see each file's header.
-extend-exclude = ["bench/baselines/vllm/swap_blocks_triton.py"]
+extend-exclude = [
+    "bench/baselines/vllm/swap_blocks_triton.py",
+    "bench/baselines/vllm/triton_unified_attention.py",
+    "bench/baselines/vllm/triton_attention_helpers.py",
+]
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "UP", "B", "SIM", "RUF"]
@@ -69,6 +73,7 @@ select = ["E", "F", "W", "I", "UP", "B", "SIM", "RUF"]
 [tool.ruff.lint.per-file-ignores]
 # Verbatim tool output used as test input.
 "tests/test_timer_check.py" = ["E501"]
+"tests/test_dram_bytes.py" = ["E501"]
 
 [tool.mypy]
 python_version = "3.11"
@@ -76,10 +81,14 @@ strict = true
 files = ["src", "bench", "scripts", "tests", "experiments"]
 mypy_path = ["src", "."]
 explicit_package_bases = true
-exclude = ["bench/baselines/vllm/swap_blocks_triton\\.py"]
+exclude = [
+    "bench/baselines/vllm/swap_blocks_triton\\.py",
+    "bench/baselines/vllm/triton_unified_attention\\.py",
+    "bench/baselines/vllm/triton_attention_helpers\\.py",
+]
 
 [[tool.mypy.overrides]]
-module = ["triton", "triton.*", "matplotlib", "matplotlib.*", "cuda", "cuda.*"]
+module = ["triton", "triton.*", "matplotlib", "matplotlib.*", "cuda", "cuda.*", "flashinfer", "flashinfer.*"]
 ignore_missing_imports = true
 
 # Experiment kernels and their tests use Triton's untyped decorator and pytest fixtures.
@@ -92,9 +101,13 @@ module = ["experiments.*.test_kernel"]
 disallow_untyped_defs = false
 disallow_incomplete_defs = false
 
-# The copied vLLM kernel is not type-checked; see its header.
+# The copied vLLM kernels are not type-checked; see each file's header.
 [[tool.mypy.overrides]]
-module = ["bench.baselines.vllm.swap_blocks_triton"]
+module = [
+    "bench.baselines.vllm.swap_blocks_triton",
+    "bench.baselines.vllm.triton_unified_attention",
+    "bench.baselines.vllm.triton_attention_helpers",
+]
 follow_imports = "skip"
 
 # @triton.jit kernels use Triton's untyped decorator.

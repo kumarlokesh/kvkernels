@@ -1,4 +1,4 @@
-.PHONY: install install-cu126 install-cu130 test test-gpu lint fmt bench-smoke check-timer plot
+.PHONY: install install-cu126 install-cu130 test test-gpu lint fmt bench-smoke check-timer dram-cascade plot
 
 # CPU torch: the devcontainer, CI and macOS.
 install:
@@ -33,6 +33,10 @@ bench-smoke:
 # Checks that the benchmark timer leaves out kernel launch overhead; needs Nsight Compute (ncu).
 check-timer:
 	uv run python -m bench.timer_check
+
+# Device-memory bytes of the cascade and per-request decode; needs Nsight Compute (ncu).
+dram-cascade:
+	uv run python -m bench.dram_bytes
 
 # Usage: make plot RESULT=results/<gpu>/<suite>/<timestamp>.json X=<param>
 plot:

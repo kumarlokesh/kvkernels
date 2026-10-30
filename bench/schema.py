@@ -49,6 +49,7 @@ class Measurement:
     pct_measured_bw: float | None
     pct_peak_compute: float | None
     host_us: float | None
+    plan_us: float | None  # CPU time of the implementation's per-batch plan, if it has one
     noisy: bool
 
 

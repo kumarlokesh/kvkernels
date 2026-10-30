@@ -7,6 +7,10 @@ a suite named ``experiments-<name>`` is ``experiments/<name>/bench_suite.py``.
 For each case, the harness checks every implementation against the first one
 listed (the reference), then times each one with a cold L2 and records median,
 p10 and p90 with derived metrics.
+
+An implementation can have a plan: host-side preparation that an engine runs
+once per batch and reuses across layers. The plan runs on fresh inputs before the
+implementation, outside the timed region; its CPU time is recorded as plan_us.
 """
 
 from __future__ import annotations
@@ -41,6 +45,7 @@ MIN_SAMPLES = 100
 MAX_SPREAD = 1.10  # p90 / median above this marks a case as noisy
 EXTRA_RUNS = 2  # reruns allowed for a noisy case
 HOST_CALLS = 1000  # calls averaged for the CPU cost per call
+PLAN_CALLS = 20  # plan calls averaged for plan_us; a plan can cost milliseconds
 
 
 @dataclass(frozen=True)
@@ -57,6 +62,15 @@ class Case:
     reference_fp32: Callable[[Tensors], Tensors] | None = None
     # Small inputs for measuring the wrapper's CPU cost per call.
     host_setup: Callable[[], Tensors] | None = None
+    # Per implementation: host preparation run on the inputs before the
+    # implementation and never timed with it (see the module docstring).
+    plans: Mapping[str, Impl] | None = None
+
+    def prepared(self, impl: str, inputs: Tensors) -> Tensors:
+        """Run the implementation's plan on inputs, if it has one, and return them."""
+        if self.plans and impl in self.plans:
+            self.plans[impl](inputs)
+        return inputs
 
 
 class CorrectnessError(AssertionError):
@@ -135,6 +149,24 @@ def host_us_per_call(impl: Impl, inputs: Tensors, calls: int = HOST_CALLS) -> fl
     return elapsed / calls * 1e6
 
 
+def plan_us_per_call(plan: Impl, inputs: Tensors, calls: int = PLAN_CALLS) -> float:
+    """CPU time per call of a plan on the case's own inputs, in microseconds.
+
+    Unlike host_us, a plan's cost grows with the batch, so it runs on the full inputs.
+    """
+    import torch
+
+    plan(inputs)
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    start = time.perf_counter()
+    for _ in range(calls):
+        plan(inputs)
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    return (time.perf_counter() - start) / calls * 1e6
+
+
 def check_case(case: Case) -> None:
     """Compare every implementation's outputs with the first one.
 
@@ -148,12 +180,12 @@ def check_case(case: Case) -> None:
     if case.check == "tolerance" and case.reference_fp32 is None:
         raise ValueError(f"case {case.params}: tolerance check needs reference_fp32")
 
-    ref_inputs = case.setup()
+    ref_inputs = case.prepared(names[0], case.setup())
     case.impls[names[0]](ref_inputs)
     ref32 = case.reference_fp32(case.setup()) if case.reference_fp32 is not None else None
 
     for name in names[1:]:
-        inputs = case.setup()
+        inputs = case.prepared(name, case.setup())
         case.impls[name](inputs)
         for out in case.outputs:
             where = f"{name} vs {names[0]}, output {out!r}, params {case.params}"
@@ -185,6 +217,7 @@ def measure(
     spec: GPUSpec | None,
     measured_peak_gbps: float | None,
     host_us: float | None,
+    plan_us: float | None = None,
 ) -> Measurement:
     """Build one Measurement with derived metrics from the median time.
 
@@ -214,6 +247,7 @@ def measure(
         pct_measured_bw=_ratio(gbps, measured_peak_gbps),
         pct_peak_compute=_ratio(tflops, peak_compute),
         host_us=host_us,
+        plan_us=plan_us,
         noisy=noisy,
     )
 
@@ -237,13 +271,17 @@ def run_suite(
     for case in cases:
         check_case(case)
         for impl_name, impl in case.impls.items():
-            inputs = case.setup()
+            inputs = case.prepared(impl_name, case.setup())
             timing, noisy = time_with_reruns(functools.partial(impl, inputs), timer)
             host_us = (
-                host_us_per_call(impl, case.host_setup()) if case.host_setup is not None else None
+                host_us_per_call(impl, case.prepared(impl_name, case.host_setup()))
+                if case.host_setup is not None
+                else None
             )
+            plan = case.plans.get(impl_name) if case.plans else None
+            plan_us = plan_us_per_call(plan, inputs) if plan is not None else None
             measurements.append(
-                measure(case, impl_name, timing, noisy, spec, measured_peak_gbps, host_us)
+                measure(case, impl_name, timing, noisy, spec, measured_peak_gbps, host_us, plan_us)
             )
             print(
                 f"{name} {case.params} {impl_name}: median {timing.median_ms * 1e3:.2f} us"

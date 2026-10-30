@@ -47,6 +47,7 @@ def make_result(**overrides: object) -> BenchResult:
         pct_measured_bw=0.9,
         pct_peak_compute=None,
         host_us=None,
+        plan_us=None,
         noisy=False,
     )
     fields = dict(

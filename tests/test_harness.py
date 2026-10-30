@@ -139,6 +139,35 @@ def test_run_suite_builds_one_measurement_per_impl() -> None:
     assert result.timer == "do_bench-cold-l2"
 
 
+def test_a_plan_runs_before_its_implementation_and_is_timed_on_its_own() -> None:
+    def plan(t: Tensors) -> None:
+        t["planned"] = t["src"].clone()
+
+    def ref(t: Tensors) -> None:
+        t["dst"].copy_(t["src"])
+
+    def needs_plan(t: Tensors) -> None:
+        t["dst"].copy_(t["planned"])  # KeyError if the plan has not run
+
+    case = dataclasses.replace(
+        copy_case({"ref": ref, "planned": needs_plan}),
+        plans={"planned": plan},
+    )
+    result = harness.run_suite(
+        "t",
+        [case],
+        None,
+        env=ENV,
+        git_sha="x",
+        flush_bytes=1,
+        measured_peak_gbps=None,
+        timer=fixed_timer([1.0] * 100, [1.0] * 100),
+    )
+    unplanned, planned = result.measurements
+    assert unplanned.plan_us is None
+    assert planned.plan_us is not None and planned.plan_us > 0
+
+
 def test_flush_buffer_must_exceed_twice_l2() -> None:
     with pytest.raises(RuntimeError, match="twice the L2"):
         harness.run_suite(
