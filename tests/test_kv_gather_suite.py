@@ -27,7 +27,7 @@ def test_large_all_layer_caches_are_left_out() -> None:
     big = [
         p
         for p in suite.grid()
-        if p["layout"] == "vllm_all_layers"
+        if p["layout"] == "vllm_BLNHC"
         and p["block"] == 16
         and p["kv_heads"] == 8
         and p["head_dim"] == 128
@@ -39,7 +39,7 @@ def test_large_all_layer_caches_are_left_out() -> None:
 def test_bytes_moved_counts_one_read_one_write_and_the_ids() -> None:
     p: Params = {
         "op": "gather",
-        "layout": "vllm_joint",
+        "layout": "vllm_LBNHC",
         "block": 16,
         "kv_heads": 8,
         "head_dim": 128,
@@ -61,7 +61,7 @@ def test_every_op_and_layout_appears() -> None:
 @pytest.mark.parametrize("op", ["gather", "scatter"])
 @pytest.mark.parametrize(
     ("layout", "block", "heads"),
-    [("vllm_joint", 16, 8), ("vllm_all_layers", 16, 8), ("sglang_default", 1, 8)],
+    [("vllm_LBNHC", 16, 8), ("vllm_BLNHC", 16, 8), ("sglang_nhd", 1, 8)],
 )
 def test_every_implementation_matches_the_reference(
     op: str, layout: str, block: int, heads: int

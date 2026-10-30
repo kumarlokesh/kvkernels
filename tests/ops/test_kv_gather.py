@@ -1,15 +1,9 @@
 """Gather and scatter of KV blocks, compared byte for byte with the PyTorch reference.
 
-Planes are built in the shapes the engines use:
-
-    vLLM, K and V together, one tensor per layer
-        [blocks, block_size, kv_heads, 2·head_dim]
-    vLLM, all layers of a block together; one layer's plane is strided
-        [blocks, layers, block_size, kv_heads, 2·head_dim]
-    SGLang default: separate K and V, one row per slot, viewed as pages
-        [slots, kv_heads, head_dim] → [pages, page_size, kv_heads, head_dim]
-    SGLang, heads before slots inside a page
-        [pages, kv_heads, page_size, head_dim]
+Planes come from caches built by kvkernels.layouts the way each engine
+allocates them: vLLM's four orders whose blocks are one run per layer (two of
+them store all layers of a block together, so a layer's plane is strided) and
+SGLang's default and heads-first buffers (separate K and V planes).
 
 Tests without the gpu mark keep every tensor at or below 65,536 elements so they
 run under the Triton interpreter.
@@ -18,7 +12,6 @@ run under the Triton interpreter.
 from __future__ import annotations
 
 import os
-from collections.abc import Callable
 
 import pytest
 
@@ -27,6 +20,8 @@ pytest.importorskip("triton")
 
 import torch
 
+from kvkernels.layouts import LAYOUTS, CacheSpec, make_cache
+from kvkernels.layouts import planes as layout_planes_of
 from kvkernels.ops.kv_gather import (
     _word_bytes,
     gather_kv_blocks,
@@ -60,51 +55,50 @@ def random_tensor(shape: tuple[int, ...], dtype: torch.dtype, seed: int = 0) -> 
     return raw.view(dtype).view(shape).to(DEVICE)
 
 
+def layout_planes(
+    name: str,
+    blocks: int,
+    block_size: int,
+    heads: int,
+    head_dim: int,
+    dtype: torch.dtype,
+    layers: int = 1,
+    layer: int = 0,
+    seed: int = 0,
+) -> Planes:
+    """The planes of one layer of an engine-shaped cache, filled with random bytes."""
+    layout = LAYOUTS[name]
+    spec = CacheSpec(layers, blocks, block_size, heads, head_dim, dtype)
+    cache = make_cache(layout, spec, DEVICE)
+    gen = torch.Generator().manual_seed(seed)
+    for tensors in cache:
+        for plane in layout_planes_of(layout, spec, tensors):
+            raw = plane.view(torch.uint8)
+            raw.copy_(torch.randint(0, 256, tuple(raw.shape), dtype=torch.uint8, generator=gen))
+    return layout_planes_of(layout, spec, cache[layer])
+
+
 def vllm_joint(
     blocks: int, block_size: int, heads: int, head_dim: int, dtype: torch.dtype
 ) -> Planes:
-    return [random_tensor((blocks, block_size, heads, 2 * head_dim), dtype)]
+    return layout_planes("vllm_LBNHC", blocks, block_size, heads, head_dim, dtype)
 
 
-def vllm_all_layers(
-    blocks: int, block_size: int, heads: int, head_dim: int, dtype: torch.dtype, layers: int = 3
-) -> Planes:
-    cache = random_tensor((blocks, layers, block_size, heads, 2 * head_dim), dtype)
-    return [cache[:, 1]]
-
-
-def sglang_default(
-    pages: int, page_size: int, heads: int, head_dim: int, dtype: torch.dtype
-) -> Planes:
-    k = random_tensor((pages * page_size, heads, head_dim), dtype, seed=1)
-    v = random_tensor((pages * page_size, heads, head_dim), dtype, seed=2)
-    return [t.view(pages, page_size, heads, head_dim) for t in (k, v)]
-
-
-def sglang_heads_first(
-    pages: int, page_size: int, heads: int, head_dim: int, dtype: torch.dtype
-) -> Planes:
-    return [random_tensor((pages, heads, page_size, head_dim), dtype, seed=s) for s in (1, 2)]
-
-
-LAYOUTS: dict[str, Callable[..., Planes]] = {
-    "vllm_joint": vllm_joint,
-    "vllm_all_layers": vllm_all_layers,
-    "sglang_default": sglang_default,
-    "sglang_heads_first": sglang_heads_first,
-}
-
-# (blocks, block or page size, kv heads, head_dim); every plane ≤ 32 blocks · 2,048 values.
+# (blocks, block or page size, kv heads, head_dim, layers, layer); every plane ≤ 32 blocks ·
+# 2,048 values, every tensor ≤ 65,536 elements.
 SMALL_SHAPES = {
-    "vllm_joint": (32, 4, 2, 64),
-    "vllm_all_layers": (16, 4, 2, 64),
-    "sglang_default": (32, 1, 4, 64),
-    "sglang_heads_first": (32, 4, 2, 64),
+    "vllm_LBNHC": (32, 4, 2, 64, 1, 0),
+    "vllm_LBHNC": (32, 4, 2, 64, 1, 0),
+    "vllm_BLNHC": (16, 4, 2, 64, 3, 1),
+    "vllm_BLHNC": (16, 4, 2, 64, 3, 1),
+    "sglang_nhd": (32, 1, 4, 64, 1, 0),
+    "sglang_hnd": (32, 4, 2, 64, 1, 0),
 }
 
 
 def make_planes(layout: str, dtype: torch.dtype = torch.float16) -> Planes:
-    return LAYOUTS[layout](*SMALL_SHAPES[layout], dtype)
+    blocks, block_size, heads, head_dim, layers, layer = SMALL_SHAPES[layout]
+    return layout_planes(layout, blocks, block_size, heads, head_dim, dtype, layers, layer)
 
 
 def ids_tensor(ids: list[int]) -> torch.Tensor:
@@ -147,25 +141,25 @@ def id_patterns(blocks: int) -> dict[str, list[int]]:
 
 
 @pytest.mark.parametrize("pattern", ["one", "permutation", "descending", "largest", "subset"])
-@pytest.mark.parametrize("layout", list(LAYOUTS))
+@pytest.mark.parametrize("layout", list(SMALL_SHAPES))
 def test_gather_matches_reference(layout: str, pattern: str) -> None:
     planes = make_planes(layout)
     check_gather(planes, id_patterns(planes[0].shape[0])[pattern])
 
 
 @pytest.mark.parametrize("pattern", ["one", "permutation", "descending", "largest", "subset"])
-@pytest.mark.parametrize("layout", list(LAYOUTS))
+@pytest.mark.parametrize("layout", list(SMALL_SHAPES))
 def test_scatter_matches_reference(layout: str, pattern: str) -> None:
     planes = make_planes(layout)
     check_scatter(planes, id_patterns(planes[0].shape[0])[pattern])
 
 
 def test_gather_copies_a_repeated_id_to_every_row() -> None:
-    check_gather(make_planes("vllm_joint"), [3, 7, 3, 3])
+    check_gather(make_planes("vllm_LBNHC"), [3, 7, 3, 3])
 
 
 def test_empty_block_ids_leave_everything_untouched() -> None:
-    planes = make_planes("sglang_default")
+    planes = make_planes("sglang_nhd")
     before = [p.clone() for p in planes]
     outs = empty_rows(planes, 0)
     gather_kv_blocks(planes, ids_tensor([]), outs)
@@ -175,7 +169,7 @@ def test_empty_block_ids_leave_everything_untouched() -> None:
 
 
 def test_gather_then_scatter_into_other_blocks_round_trips() -> None:
-    planes = make_planes("vllm_joint")
+    planes = make_planes("vllm_LBNHC")
     sent = [12, 5, 30, 0]
     received = [1, 31, 7, 20]  # the receiver's own free blocks
     staging = empty_rows(planes, len(sent))
@@ -242,13 +236,13 @@ def test_word_width_divides_sizes_and_addresses() -> None:
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.float32])
 def test_interpreter_dtypes(dtype: torch.dtype) -> None:
-    planes = sglang_heads_first(16, 2, 2, 64, dtype)
+    planes = layout_planes("sglang_hnd", 16, 2, 2, 64, dtype)
     check_gather(planes, [4, 15, 0])
     check_scatter(planes, [4, 15, 0])
 
 
 def test_validate_rejects_an_out_of_range_id() -> None:
-    planes = make_planes("vllm_joint")
+    planes = make_planes("vllm_LBNHC")
     blocks = planes[0].shape[0]
     with pytest.raises(IndexError):
         gather_kv_blocks(planes, ids_tensor([0, blocks]), empty_rows(planes, 2), validate=True)
@@ -257,13 +251,13 @@ def test_validate_rejects_an_out_of_range_id() -> None:
 
 
 def test_validate_rejects_a_repeated_id_in_scatter() -> None:
-    planes = make_planes("vllm_joint")
+    planes = make_planes("vllm_LBNHC")
     with pytest.raises(ValueError, match="repeated"):
         scatter_kv_blocks(empty_rows(planes, 2), ids_tensor([4, 4]), planes, validate=True)
 
 
 def test_rejects_bad_arguments() -> None:
-    planes = make_planes("vllm_joint")
+    planes = make_planes("vllm_LBNHC")
     ids = ids_tensor([1, 2])
     outs = empty_rows(planes, 2)
     with pytest.raises(ValueError, match="int32"):
@@ -284,7 +278,7 @@ def test_rejects_bad_arguments() -> None:
 
 
 def test_rejects_an_output_that_overlaps_its_plane() -> None:
-    planes = make_planes("vllm_joint")
+    planes = make_planes("vllm_LBNHC")
     with pytest.raises(ValueError, match="overlaps"):
         gather_kv_blocks(planes, ids_tensor([5, 6]), [planes[0][:2]])
     with pytest.raises(ValueError, match="overlaps"):
@@ -296,12 +290,13 @@ def test_rejects_an_output_that_overlaps_its_plane() -> None:
 # ---------------------------------------------------------------------------
 
 FULL_SHAPES = [
-    ("vllm_joint", (2048, 16, 8, 128)),
-    ("vllm_joint", (2048, 32, 8, 64)),
-    ("vllm_all_layers", (256, 16, 8, 128)),
-    ("sglang_default", (8192, 1, 8, 128)),
-    ("sglang_default", (2048, 16, 1, 128)),
-    ("sglang_heads_first", (2048, 16, 8, 128)),
+    ("vllm_LBNHC", (2048, 16, 8, 128)),
+    ("vllm_LBNHC", (2048, 32, 8, 64)),
+    ("vllm_LBHNC", (2048, 16, 8, 128)),
+    ("vllm_BLNHC", (256, 16, 8, 128)),
+    ("sglang_nhd", (8192, 1, 8, 128)),
+    ("sglang_nhd", (2048, 16, 1, 128)),
+    ("sglang_hnd", (2048, 16, 8, 128)),
 ]
 
 
@@ -309,7 +304,8 @@ FULL_SHAPES = [
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float8_e4m3fn])
 @pytest.mark.parametrize(("layout", "shape"), FULL_SHAPES)
 def test_full_shapes(layout: str, shape: tuple[int, int, int, int], dtype: torch.dtype) -> None:
-    planes = LAYOUTS[layout](*shape, dtype)
+    layers, layer = (3, 1) if layout.startswith("vllm_BL") else (1, 0)
+    planes = layout_planes(layout, *shape, dtype, layers, layer)
     blocks = planes[0].shape[0]
     ids = torch.randperm(blocks, generator=torch.Generator().manual_seed(5))[:512].tolist()
     check_gather(planes, ids)

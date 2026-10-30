@@ -1,14 +1,14 @@
 """Gather and scatter of KV blocks: kvkernels against PyTorch, vLLM's copy kernel and DMA.
 
-Each case moves one plane, the unit the op launches on:
+Each case moves one plane, the unit the op launches on, from a cache built by
+kvkernels.layouts the way the engine allocates it:
 
-    vllm_joint        one layer's KV cache, K and V together
-                      [blocks, block_size, heads, 2·head_dim]
-    vllm_all_layers   layer 1 of a cache that stores 32 layers per block
-                      [blocks, 32, block_size, heads, 2·head_dim]; consecutive blocks
-                      of one layer are 32 layers' worth of bytes apart
-    sglang_default    the K tensor of one layer, one row per slot, viewed as pages
-                      [pages, page_size, heads, head_dim]; V is a second, identical plane
+    vllm_LBNHC   vLLM's default: one layer's KV, K and V together, each block one run
+                 [blocks, block_size, heads, 2·head_dim]
+    vllm_BLNHC   layer 1 of a cache that stores the 32 layers of a block together;
+                 consecutive blocks of one layer are 32 layers' worth of bytes apart
+    sglang_nhd   SGLang's default: the K buffer of one layer viewed as pages
+                 [pages, page_size, heads, head_dim]; V is a second, identical plane
 
 Implementations, all checked bit for bit against the first:
 
@@ -25,9 +25,9 @@ job list in one cuMemcpyBatchAsync call; cuda_batched_dma builds the list once p
 set of inputs, cuda_batched_dma_build_jobs rebuilds it on every call, so the
 difference in host_us is the cost of building it on the host.
 
-Every cache holds at least 640 MiB, eight times the largest L2 among the target
+Every plane spans at least 640 MiB, eight times the largest L2 among the target
 GPUs, so most blocks are read from device memory. Cases whose cache would exceed
-8 GiB are left out.
+8 GiB (all layers for vllm_BLNHC, K and V for sglang_nhd) are left out.
 """
 
 from __future__ import annotations
@@ -48,17 +48,17 @@ ALL_LAYERS = 32
 NUM_IDS = (64, 512, 4096, 32768)
 ORDERS = ("random", "sorted")
 HEADS_AND_DIMS = ((8, 128), (8, 64), (1, 128))
-BLOCK_SIZES = {"vllm_joint": (16, 32), "vllm_all_layers": (16, 32), "sglang_default": (1, 16)}
+BLOCK_SIZES = {"vllm_LBNHC": (16, 32), "vllm_BLNHC": (16, 32), "sglang_nhd": (1, 16)}
 
 
 def block_shape(layout: str, block: int, heads: int, head_dim: int) -> tuple[int, ...]:
-    if layout == "sglang_default":
+    if layout.startswith("sglang"):
         return (block, heads, head_dim)
     return (block, heads, 2 * head_dim)
 
 
 def layers_per_block(layout: str) -> int:
-    return ALL_LAYERS if layout == "vllm_all_layers" else 1
+    return ALL_LAYERS if layout == "vllm_BLNHC" else 1
 
 
 def num_blocks(layout: str, block_bytes: int, num_ids: int) -> int:
@@ -67,7 +67,10 @@ def num_blocks(layout: str, block_bytes: int, num_ids: int) -> int:
 
 
 def cache_bytes(layout: str, block_bytes: int, num_ids: int) -> int:
-    return num_blocks(layout, block_bytes, num_ids) * block_bytes * layers_per_block(layout)
+    """Bytes the cache allocates: every layer of it, and both K and V for SGLang."""
+    buffers = 2 if layout.startswith("sglang") else 1
+    blocks = num_blocks(layout, block_bytes, num_ids)
+    return blocks * block_bytes * layers_per_block(layout) * buffers
 
 
 def _dtype(name: str) -> Any:
@@ -88,24 +91,27 @@ def make_inputs(params: Params, *, tiny_blocks: bool = False, device: str = "cud
     """
     import torch
 
-    layout = str(params["layout"])
+    from kvkernels.layouts import LAYOUTS, CacheSpec, make_cache, planes
+
+    name = str(params["layout"])
     dtype = _dtype(str(params["dtype"]))
     n = int(params["num_ids"])
+    layers = layers_per_block(name)
     if tiny_blocks:
-        shape: tuple[int, ...] = (1, 1, 16 // _element_size(str(params["dtype"])) * 2)
-        blocks = n
+        block, heads, head_dim = 1, 1, 8
+        blocks = max(n, 2)
     else:
-        shape = block_shape(
-            layout, int(params["block"]), int(params["kv_heads"]), int(params["head_dim"])
-        )
-        block_bytes = math.prod(shape) * _element_size(str(params["dtype"]))
-        blocks = num_blocks(layout, block_bytes, n)
+        block, heads, head_dim = (int(params[k]) for k in ("block", "kv_heads", "head_dim"))
+        shape = block_shape(name, block, heads, head_dim)
+        blocks = num_blocks(name, math.prod(shape) * _element_size(str(params["dtype"])), n)
 
+    layout = LAYOUTS[name]
+    spec = CacheSpec(layers, blocks, block, heads, head_dim, dtype)
+    layer = make_cache(layout, spec, device)[1 if layers > 1 else 0]
+    plane = planes(layout, spec, layer)[0]
     gen = torch.Generator(device=device).manual_seed(0)
-    layers = layers_per_block(layout)
-    cache = torch.empty((blocks, layers, *shape), dtype=dtype, device=device)
-    cache.view(torch.uint8).random_(0, 256, generator=gen)
-    plane = cache[:, 1] if layers > 1 else cache[:, 0]
+    plane.view(torch.uint8).random_(0, 256, generator=gen)
+    shape = tuple(plane.shape[1:])
 
     order = torch.randperm(blocks, generator=torch.Generator().manual_seed(1))[:n]
     if params["order"] == "sorted":
@@ -333,7 +339,7 @@ def grid() -> Iterator[Params]:
         # bf16 once per op: the bytes moved are the same, so the time should be too.
         yield {
             "op": op,
-            "layout": "vllm_joint",
+            "layout": "vllm_LBNHC",
             "block": 16,
             "kv_heads": 8,
             "head_dim": 128,
