@@ -346,3 +346,39 @@ def test_offsets_past_two_to_the_31_words() -> None:
     src = random_tensor((1, 4097), torch.uint8, seed=6)
     scatter_kv_blocks([src], ids_tensor([blocks - 2]), [plane])
     assert_exact(plane[blocks - 2 : blocks - 1], src)
+
+
+def test_ops_are_registered_and_declare_what_they_write() -> None:
+    gather = torch.ops.kvkernels.gather_kv_blocks.default._schema
+    scatter = torch.ops.kvkernels.scatter_kv_blocks.default._schema
+    assert [a.name for a in gather.arguments if a.alias_info and a.alias_info.is_write] == ["outs"]
+    assert [a.name for a in scatter.arguments if a.alias_info and a.alias_info.is_write] == [
+        "planes"
+    ]
+
+
+def test_calling_the_registered_op_directly() -> None:
+    planes = make_planes("sglang_nhd")
+    ids = ids_tensor([4, 0, 31])
+    outs = empty_rows(planes, 3)
+    expected = empty_rows(planes, 3)
+    torch.ops.kvkernels.gather_kv_blocks(planes, ids, outs, False)
+    gather_kv_blocks_ref(planes, ids, expected)
+    for out, ref in zip(outs, expected, strict=True):
+        assert_exact(out, ref)
+
+
+@pytest.mark.gpu
+def test_runs_under_torch_compile() -> None:
+    planes = layout_planes("vllm_LBNHC", 64, 16, 8, 128, torch.float16)
+    ids = ids_tensor([63, 5, 17])
+    outs = empty_rows(planes, 3)
+
+    def step(planes: Planes, ids: torch.Tensor, outs: Planes) -> None:
+        gather_kv_blocks(planes, ids, outs)
+
+    torch.compile(step, fullgraph=True)(planes, ids, outs)
+    expected = empty_rows(planes, 3)
+    gather_kv_blocks_ref(planes, ids, expected)
+    for out, ref in zip(outs, expected, strict=True):
+        assert_exact(out, ref)

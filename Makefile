@@ -5,11 +5,12 @@ install:
 	uv sync --extra cpu --extra bench
 
 # CUDA torch: rented GPU machines. Pick the build the machine's driver supports.
+# The baselines extra (FlashInfer) compiles kernels on first use and needs nvcc.
 install-cu126:
-	uv sync --extra cu126 --extra bench
+	uv sync --extra cu126 --extra bench --extra baselines
 
 install-cu130:
-	uv sync --extra cu130 --extra bench
+	uv sync --extra cu130 --extra bench --extra baselines
 
 test:
 	TRITON_INTERPRET=1 uv run pytest -m "not gpu"

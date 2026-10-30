@@ -21,7 +21,9 @@ cpu = ["torch==2.14.1"]
 cu126 = ["torch==2.14.1; sys_platform == 'linux'", "cuda-bindings==12.9.10; sys_platform == 'linux'"]
 cu130 = ["torch==2.14.1; sys_platform == 'linux'", "cuda-bindings==13.4.4; sys_platform == 'linux'"]
 bench = ["matplotlib>=3.8", "pandas>=2.1"]
-# baselines: flashinfer-python, added and pinned together with the attention benchmarks.
+# Benchmark baselines on GPU machines. FlashInfer compiles its kernels on first use,
+# so the machine also needs the CUDA compiler.
+baselines = ["flashinfer-python==0.7.2; sys_platform == 'linux'"]
 
 [dependency-groups]
 dev = ["mypy>=1.11", "pytest>=8", "ruff>=0.6"]

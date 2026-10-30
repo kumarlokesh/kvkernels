@@ -261,6 +261,54 @@ def _check_tiles(planes: Sequence[torch.Tensor]) -> None:
             raise ValueError(f"plane {p}: a block of {block_bytes} bytes is too large")
 
 
+# Registered as PyTorch custom ops, so torch.compile and engines treat each call as one
+# opaque operation that writes into the tensors named in mutates_args.
+@torch.library.custom_op("kvkernels::gather_kv_blocks", mutates_args=("outs",))
+def _gather_op(
+    planes: list[torch.Tensor], block_ids: torch.Tensor, outs: list[torch.Tensor], validate: bool
+) -> None:
+    device = _check_pairs(planes, outs, _num_ids(block_ids), "outs")
+    if block_ids.device != device:
+        raise ValueError(f"block_ids is on {block_ids.device}, the planes on {device}")
+    _check_tiles(planes)
+    if block_ids.numel() == 0:
+        return
+    if validate:
+        _validate_ids(planes, block_ids, unique=False)
+    for plane, out in zip(planes, outs, strict=True):
+        _copy_plane(plane, out, block_ids, gather=True)
+
+
+@_gather_op.register_fake
+def _gather_fake(
+    planes: list[torch.Tensor], block_ids: torch.Tensor, outs: list[torch.Tensor], validate: bool
+) -> None:
+    return None
+
+
+@torch.library.custom_op("kvkernels::scatter_kv_blocks", mutates_args=("planes",))
+def _scatter_op(
+    srcs: list[torch.Tensor], block_ids: torch.Tensor, planes: list[torch.Tensor], validate: bool
+) -> None:
+    device = _check_pairs(planes, srcs, _num_ids(block_ids), "srcs")
+    if block_ids.device != device:
+        raise ValueError(f"block_ids is on {block_ids.device}, the planes on {device}")
+    _check_tiles(planes)
+    if block_ids.numel() == 0:
+        return
+    if validate:
+        _validate_ids(planes, block_ids, unique=True)
+    for src, plane in zip(srcs, planes, strict=True):
+        _copy_plane(plane, src, block_ids, gather=False)
+
+
+@_scatter_op.register_fake
+def _scatter_fake(
+    srcs: list[torch.Tensor], block_ids: torch.Tensor, planes: list[torch.Tensor], validate: bool
+) -> None:
+    return None
+
+
 def gather_kv_blocks(
     planes: Sequence[torch.Tensor],
     block_ids: torch.Tensor,
@@ -276,17 +324,9 @@ def gather_kv_blocks(
         check that (it synchronizes with the host).
     outs[p]: [len(block_ids), *block_shape], contiguous, same dtype as planes[p],
         not overlapping any plane.
+    Runs as the custom op kvkernels::gather_kv_blocks.
     """
-    device = _check_pairs(planes, outs, _num_ids(block_ids), "outs")
-    if block_ids.device != device:
-        raise ValueError(f"block_ids is on {block_ids.device}, the planes on {device}")
-    _check_tiles(planes)
-    if block_ids.numel() == 0:
-        return
-    if validate:
-        _validate_ids(planes, block_ids, unique=False)
-    for plane, out in zip(planes, outs, strict=True):
-        _copy_plane(plane, out, block_ids, gather=True)
+    _gather_op(list(planes), block_ids, list(outs), validate)
 
 
 def scatter_kv_blocks(
@@ -301,14 +341,6 @@ def scatter_kv_blocks(
     Arguments as for gather_kv_blocks, with srcs in place of outs. Ids must be
     distinct: with a repeated id, the block's final contents are undefined.
     validate=True checks range and distinctness (it synchronizes with the host).
+    Runs as the custom op kvkernels::scatter_kv_blocks.
     """
-    device = _check_pairs(planes, srcs, _num_ids(block_ids), "srcs")
-    if block_ids.device != device:
-        raise ValueError(f"block_ids is on {block_ids.device}, the planes on {device}")
-    _check_tiles(planes)
-    if block_ids.numel() == 0:
-        return
-    if validate:
-        _validate_ids(planes, block_ids, unique=True)
-    for src, plane in zip(srcs, planes, strict=True):
-        _copy_plane(plane, src, block_ids, gather=False)
+    _scatter_op(list(srcs), block_ids, list(planes), validate)
