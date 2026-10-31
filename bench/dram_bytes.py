@@ -31,7 +31,6 @@ import dataclasses
 import io
 import json
 import shutil
-import subprocess
 import sys
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -39,6 +38,7 @@ from datetime import datetime
 from pathlib import Path
 
 from bench.schema import EnvInfo, Params, utc_now
+from bench.timer_check import run_ncu
 
 NVTX_RANGE = "dram"
 SHAPES = [(batch, prefix) for batch in (32, 128) for prefix in (4096, 32768)]
@@ -135,7 +135,7 @@ def measure(batch: int, prefix: int, impl_name: str) -> Traffic:
         str(prefix),
         impl_name,
     ]
-    out = subprocess.run(cmd, check=True, capture_output=True, text=True).stdout
+    out = run_ncu(cmd)
     values = parse_ncu_bytes(out)
     reads, writes = values[METRICS[0]], values[METRICS[1]]
     if not reads or len(reads) != len(writes):

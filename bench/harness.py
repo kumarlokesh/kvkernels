@@ -6,7 +6,10 @@ A suite is a module ``bench/suites/<name>.py`` with ``cases() -> Iterable[Case]`
 a suite named ``experiments-<name>`` is ``experiments/<name>/bench_suite.py``.
 For each case, the harness checks every implementation against the first one
 listed (the reference), then times each one with a cold L2 and records median,
-p10 and p90 with derived metrics.
+p10 and p90 with derived metrics. The reference's outputs wait in host memory
+while the others run, so the GPU holds one implementation's inputs at a time. A
+case that still runs out of GPU memory is recorded under left_out with the
+reason, and the suite goes on.
 
 An implementation can have a plan: host-side preparation that an engine runs
 once per batch and reuses across layers. The plan runs on fresh inputs before the
@@ -18,6 +21,7 @@ from __future__ import annotations
 import argparse
 import functools
 import importlib
+import os
 import subprocess
 import sys
 import time
@@ -28,7 +32,15 @@ from typing import TYPE_CHECKING, Literal
 
 import numpy as np
 
-from bench.schema import SCHEMA_VERSION, BenchResult, EnvInfo, Measurement, Params, utc_now
+from bench.schema import (
+    SCHEMA_VERSION,
+    BenchResult,
+    EnvInfo,
+    LeftOut,
+    Measurement,
+    Params,
+    utc_now,
+)
 from kvkernels.specs import GPUSpec, peak_tensor_tflops
 
 if TYPE_CHECKING:
@@ -45,6 +57,7 @@ MIN_SAMPLES = 100
 MAX_SPREAD = 1.10  # p90 / median above this marks a case as noisy
 EXTRA_RUNS = 2  # reruns allowed for a noisy case
 HOST_CALLS = 1000  # calls averaged for the CPU cost per call
+HOST_SECONDS = 1.0  # or fewer calls, once this much time has passed
 PLAN_CALLS = 20  # plan calls averaged for plan_us; a plan can cost milliseconds
 
 
@@ -129,8 +142,17 @@ def time_with_reruns(fn: Callable[[], None], timer: Timer) -> tuple[Timing, bool
     return best, best.spread > MAX_SPREAD
 
 
-def host_us_per_call(impl: Impl, inputs: Tensors, calls: int = HOST_CALLS) -> float:
+def host_us_per_call(
+    impl: Impl, inputs: Tensors, calls: int = HOST_CALLS, seconds: float = HOST_SECONDS
+) -> float:
     """CPU time per call of an implementation, in microseconds.
+
+    Averages over `calls` calls, or over the calls made before `seconds` have
+    passed if that comes first. Without the time limit, an implementation whose
+    calls each queue milliseconds of GPU work (one copy job per block, tens of
+    thousands of blocks) would spend minutes here, and once the GPU's launch
+    queue filled, each call could wait for the GPU and the average would include
+    that wait.
 
     Reported separately from GPU time: engines run decode under CUDA graphs,
     where this cost is paid once at capture.
@@ -140,13 +162,17 @@ def host_us_per_call(impl: Impl, inputs: Tensors, calls: int = HOST_CALLS) -> fl
     impl(inputs)
     if torch.cuda.is_available():
         torch.cuda.synchronize()
+    made = 0
     start = time.perf_counter()
-    for _ in range(calls):
+    while made < calls:
         impl(inputs)
+        made += 1
+        if time.perf_counter() - start >= seconds:
+            break
     elapsed = time.perf_counter() - start
     if torch.cuda.is_available():
         torch.cuda.synchronize()
-    return elapsed / calls * 1e6
+    return elapsed / made * 1e6
 
 
 def plan_us_per_call(plan: Impl, inputs: Tensors, calls: int = PLAN_CALLS) -> float:
@@ -180,23 +206,34 @@ def check_case(case: Case) -> None:
     if case.check == "tolerance" and case.reference_fp32 is None:
         raise ValueError(f"case {case.params}: tolerance check needs reference_fp32")
 
+    def outputs_on_host(inputs: Tensors) -> Tensors:
+        return {out: inputs[out].cpu() for out in case.outputs}
+
     ref_inputs = case.prepared(names[0], case.setup())
     case.impls[names[0]](ref_inputs)
-    ref32 = case.reference_fp32(case.setup()) if case.reference_fp32 is not None else None
+    ref = outputs_on_host(ref_inputs)
+    del ref_inputs
+    ref32 = (
+        outputs_on_host(case.reference_fp32(case.setup()))
+        if case.reference_fp32 is not None
+        else None
+    )
 
     for name in names[1:]:
         inputs = case.prepared(name, case.setup())
         case.impls[name](inputs)
+        got = outputs_on_host(inputs)
+        del inputs
         for out in case.outputs:
             where = f"{name} vs {names[0]}, output {out!r}, params {case.params}"
             if case.check == "exact":
                 try:
-                    assert_exact(inputs[out], ref_inputs[out])
+                    assert_exact(got[out], ref[out])
                 except AssertionError as exc:
                     raise CorrectnessError(f"{where}: {exc}") from exc
             else:
                 assert ref32 is not None
-                result = check_close(inputs[out], ref_inputs[out], ref32[out])
+                result = check_close(got[out], ref[out], ref32[out])
                 if not result.ok:
                     raise CorrectnessError(
                         f"{where}: error {result.err:.3e} > allowed {result.allowed:.3e}"
@@ -267,28 +304,18 @@ def run_suite(
         raise RuntimeError(
             f"L2 flush buffer ({flush_bytes} B) must exceed twice the L2 ({spec.l2_bytes} B)"
         )
+    import torch
+
     measurements: list[Measurement] = []
+    left_out: list[LeftOut] = []
     for case in cases:
-        check_case(case)
-        for impl_name, impl in case.impls.items():
-            inputs = case.prepared(impl_name, case.setup())
-            timing, noisy = time_with_reruns(functools.partial(impl, inputs), timer)
-            host_us = (
-                host_us_per_call(impl, case.prepared(impl_name, case.host_setup()))
-                if case.host_setup is not None
-                else None
-            )
-            plan = case.plans.get(impl_name) if case.plans else None
-            plan_us = plan_us_per_call(plan, inputs) if plan is not None else None
-            measurements.append(
-                measure(case, impl_name, timing, noisy, spec, measured_peak_gbps, host_us, plan_us)
-            )
-            print(
-                f"{name} {case.params} {impl_name}: median {timing.median_ms * 1e3:.2f} us"
-                f" (p10 {timing.p10_ms * 1e3:.2f}, p90 {timing.p90_ms * 1e3:.2f},"
-                f" n={timing.samples}){' NOISY' if noisy else ''}",
-                flush=True,
-            )
+        try:
+            measurements.extend(_run_case(name, case, spec, measured_peak_gbps, timer))
+        except torch.OutOfMemoryError as exc:
+            reason = f"out of GPU memory: {str(exc).splitlines()[0]}"
+            left_out.append(LeftOut(params=case.params, reason=reason))
+            print(f"{name} {case.params}: left out, {reason}", flush=True)
+            torch.cuda.empty_cache()
     return BenchResult(
         schema_version=SCHEMA_VERSION,
         suite=name,
@@ -299,11 +326,51 @@ def run_suite(
         env=env,
         measured_peak_gbps=measured_peak_gbps,
         measurements=measurements,
+        left_out=left_out,
     )
 
 
+def _run_case(
+    name: str,
+    case: Case,
+    spec: GPUSpec | None,
+    measured_peak_gbps: float | None,
+    timer: Timer,
+) -> list[Measurement]:
+    """Check one case, then time each implementation; all or nothing."""
+    check_case(case)
+    measurements = []
+    for impl_name, impl in case.impls.items():
+        inputs = case.prepared(impl_name, case.setup())
+        timing, noisy = time_with_reruns(functools.partial(impl, inputs), timer)
+        host_us = (
+            host_us_per_call(impl, case.prepared(impl_name, case.host_setup()))
+            if case.host_setup is not None
+            else None
+        )
+        plan = case.plans.get(impl_name) if case.plans else None
+        plan_us = plan_us_per_call(plan, inputs) if plan is not None else None
+        del inputs
+        measurements.append(
+            measure(case, impl_name, timing, noisy, spec, measured_peak_gbps, host_us, plan_us)
+        )
+        print(
+            f"{name} {case.params} {impl_name}: median {timing.median_ms * 1e3:.2f} us"
+            f" (p10 {timing.p10_ms * 1e3:.2f}, p90 {timing.p90_ms * 1e3:.2f},"
+            f" n={timing.samples}){' NOISY' if noisy else ''}",
+            flush=True,
+        )
+    return measurements
+
+
 def git_sha(repo: Path = Path(".")) -> str:
-    """HEAD commit, prefixed with "dirty-" when the working tree has uncommitted changes."""
+    """HEAD commit, prefixed with "dirty-" when the working tree has uncommitted changes.
+
+    KVKERNELS_GIT_SHA, when set, is used instead: a copy of the source without
+    .git (a Kaggle session) carries the value computed where the copy was made.
+    """
+    if sha := os.environ.get("KVKERNELS_GIT_SHA"):
+        return sha
     try:
         sha = subprocess.run(
             ["git", "-C", str(repo), "rev-parse", "HEAD"],

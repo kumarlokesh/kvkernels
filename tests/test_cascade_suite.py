@@ -8,6 +8,7 @@ on small batches and are checked the way the harness checks them on a GPU.
 from __future__ import annotations
 
 import dataclasses
+import importlib.util
 import os
 
 import pytest
@@ -148,8 +149,20 @@ def test_planned_implementations_report_plan_time() -> None:
     assert plan_us and all(us is not None and us > 0 for us in plan_us.values())
 
 
+def flashinfer_installed() -> bool:
+    return importlib.util.find_spec("flashinfer") is not None
+
+
+@pytest.mark.gpu
+def test_flashinfer_runs_where_it_is_installed() -> None:
+    # Without this, a FlashInfer that fails to build would drop out of the suite unseen.
+    if not flashinfer_installed():
+        pytest.skip("FlashInfer is not installed (the baselines extra)")
+    assert suite.flashinfer_runs()
+
+
 @pytest.mark.gpu
 @pytest.mark.parametrize("batch", [4, 32])
 def test_every_implementation_matches_on_a_full_shape(batch: int) -> None:
     p = suite._params(batch=batch, prefix=2048, suffix=128)
-    harness.check_case(suite.make_case(p, with_flashinfer=suite.flashinfer_runs()))
+    harness.check_case(suite.make_case(p, with_flashinfer=flashinfer_installed()))

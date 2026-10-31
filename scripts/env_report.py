@@ -36,7 +36,7 @@ def main() -> int:
 
     restricted = env.counters_restricted()
     if restricted is None:
-        print(f"{'perf_counters':16s} unknown (no {env.NVIDIA_PARAMS})")
+        print(f"{'perf_counters':16s} unknown (ncu gave no answer and no {env.NVIDIA_PARAMS})")
     elif restricted:
         print(f"{'perf_counters':16s} RESTRICTED: Nsight Compute will fail with ERR_NVGPUCTRPERM")
         print("                 kernel profiling needs a provider that allows counter access")

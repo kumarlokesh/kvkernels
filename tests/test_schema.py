@@ -10,6 +10,7 @@ from bench.schema import (
     SCHEMA_VERSION,
     BenchResult,
     EnvInfo,
+    LeftOut,
     Measurement,
     SchemaError,
     from_dict,
@@ -60,6 +61,7 @@ def make_result(**overrides: object) -> BenchResult:
         env=env,
         measured_peak_gbps=250.0,
         measurements=[m],
+        left_out=[LeftOut(params={"bytes": 1 << 34}, reason="out of GPU memory")],
     )
     fields.update(overrides)
     return BenchResult(**fields)  # type: ignore[arg-type]

@@ -11,28 +11,36 @@ Back on a development machine, after copying <dir> over:
 Steps, in the order they run:
 
     env            scripts/env_report.py; always runs, and runs first
-    test-gpu       the GPU tests (make test-gpu)
+    test-gpu       the package's GPU tests (tests/)
+    test-gpu-experiments
+                   the experiments' GPU tests (experiments/); about an hour on a T4,
+                   so it runs only when chosen or when matmul or attention runs
     smoke          the smoke suite (make bench-smoke)
     timer          the timer check (make check-timer); needs Nsight Compute counters
     kv_gather      the kv_gather suite
-    matmul         the K2 matmul suite
-    attention      the K2 fused attention suite
+    matmul         the K2 matmul suite; needs test-gpu-experiments
+    attention      the K2 fused attention suite; needs test-gpu-experiments
     cascade        the cascade suite
     dram           the device-memory bytes run (make dram-cascade); needs the counters
-    old-torch      the GPU tests again with torch 2.13.0 and Triton 3.7.1, in a
-                   separate environment (the release's lowest supported versions)
+    old-torch      the package's GPU tests (tests/ only) again with torch 2.13.0 and
+                   Triton 3.7.1, in a separate environment (the release's lowest
+                   supported versions); experiments/ follows the lock file only
 
 Each step runs the command its Makefile target runs, without make, which some
 GPU images lack. If env fails (no usable GPU), nothing else runs. A step that writes results
-runs only after test-gpu has passed in the same session, and collect copies
-results only from such a session, so no result reaches results/ from a machine
-where the GPU tests failed. Both test steps set KVKERNELS_REQUIRE_GPU=1, so a
-missing GPU fails them instead of skipping every test. Any other failing step
+runs only after test-gpu (and, for the experiment suites, test-gpu-experiments)
+has passed in the same session; choosing such a step adds the test steps it
+needs. collect copies results only from a session where test-gpu passed, so no
+result reaches results/ from a machine where the GPU tests failed. Every test
+step sets KVKERNELS_REQUIRE_GPU=1, so a missing GPU fails it instead of skipping
+every test. Any other failing step
 is recorded and the session goes on with the next one.
 
 The output directory holds manifest.json (each step's command, exit code,
 duration and log file), one log per step, and a copy of every result file the
-session wrote, under results/.
+session wrote, under results/. The manifest and the copy are brought up to date
+after every step, so a session stopped partway (a provider's time limit) keeps
+what its finished steps wrote.
 """
 
 from __future__ import annotations
@@ -59,6 +67,15 @@ class Step:
     name: str
     command: str  # run with the shell, from the repository root
     writes_results: bool = False
+    needs: tuple[str, ...] = ()  # test steps that must pass first
+
+
+def _tests(path: str) -> str:
+    return f"KVKERNELS_REQUIRE_GPU=1 uv run pytest {path} -m gpu -v --durations=20"
+
+
+RESULT_TESTS = ("test-gpu",)
+EXPERIMENT_TESTS = ("test-gpu", "test-gpu-experiments")
 
 
 def _suite(name: str) -> str:
@@ -67,21 +84,27 @@ def _suite(name: str) -> str:
 
 STEPS = (
     Step("env", "uv run python scripts/env_report.py"),
-    Step("test-gpu", "KVKERNELS_REQUIRE_GPU=1 uv run pytest -m gpu -v --durations=20"),
-    Step("smoke", _suite("smoke"), writes_results=True),
+    Step("test-gpu", _tests("tests")),
+    Step("test-gpu-experiments", _tests("experiments")),
+    Step("smoke", _suite("smoke"), writes_results=True, needs=RESULT_TESTS),
     Step("timer", "uv run python -m bench.timer_check"),
-    Step("kv_gather", _suite("kv_gather"), writes_results=True),
-    Step("matmul", _suite("experiments-matmul"), writes_results=True),
-    Step("attention", _suite("experiments-fused_attention_fwd"), writes_results=True),
-    Step("cascade", _suite("cascade"), writes_results=True),
-    Step("dram", "uv run python -m bench.dram_bytes", writes_results=True),
+    Step("kv_gather", _suite("kv_gather"), writes_results=True, needs=RESULT_TESTS),
+    Step("matmul", _suite("experiments-matmul"), writes_results=True, needs=EXPERIMENT_TESTS),
+    Step(
+        "attention",
+        _suite("experiments-fused_attention_fwd"),
+        writes_results=True,
+        needs=EXPERIMENT_TESTS,
+    ),
+    Step("cascade", _suite("cascade"), writes_results=True, needs=RESULT_TESTS),
+    Step("dram", "uv run python -m bench.dram_bytes", writes_results=True, needs=RESULT_TESTS),
     Step(
         "old-torch",
         f"uv venv -q --allow-existing {OLD_TORCH_ENV}"
         f" && uv pip install -q -p {OLD_TORCH_ENV} --index-url {OLD_TORCH_INDEX} torch==2.13.0"
         f" && uv pip install -q -p {OLD_TORCH_ENV} triton==3.7.1 numpy pytest"
         f" && KVKERNELS_REQUIRE_GPU=1 PYTHONPATH=src:."
-        f" {OLD_TORCH_ENV}/bin/python -m pytest -m gpu -v -p no:cacheprovider",
+        f" {OLD_TORCH_ENV}/bin/python -m pytest tests -m gpu -v -p no:cacheprovider",
     ),
 )
 STEP_NAMES = tuple(s.name for s in STEPS)
@@ -115,13 +138,14 @@ class Manifest:
 
 
 def select(names: Sequence[str] | None) -> list[Step]:
-    """The steps to run, in session order; env is always included."""
+    """The steps to run, in session order; env and the tests they need are included."""
     if names is None:
         return list(STEPS)
     unknown = sorted(set(names) - set(STEP_NAMES))
     if unknown:
         raise ValueError(f"unknown steps {unknown}; known: {', '.join(STEP_NAMES)}")
     wanted = {"env", *names}
+    wanted |= {need for s in STEPS if s.name in wanted for need in s.needs}
     return [s for s in STEPS if s.name in wanted]
 
 
@@ -150,7 +174,12 @@ def shell_runner(command: str, log: Path) -> int:
         return proc.wait()
 
 
-def run(steps: Sequence[Step], out: Path, runner: Runner = shell_runner) -> Manifest:
+def run(
+    steps: Sequence[Step],
+    out: Path,
+    runner: Runner = shell_runner,
+    results: Path = ROOT / "results",
+) -> Manifest:
     out.mkdir(parents=True, exist_ok=True)
     manifest = Manifest(datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"))
     for step in steps:
@@ -160,10 +189,10 @@ def run(steps: Sequence[Step], out: Path, runner: Runner = shell_runner) -> Mani
             )
             manifest.write(out)
             continue
-        if step.writes_results and not manifest.passed("test-gpu"):
-            manifest.steps.append(
-                StepRecord(step.name, step.command, None, 0.0, None, "test-gpu did not pass")
-            )
+        failed = [need for need in step.needs if not manifest.passed(need)]
+        if failed:
+            reason = f"{', '.join(failed)} did not pass"
+            manifest.steps.append(StepRecord(step.name, step.command, None, 0.0, None, reason))
             manifest.write(out)
             continue
         print(f"\n=== {step.name}: {step.command}", flush=True)
@@ -173,11 +202,10 @@ def run(steps: Sequence[Step], out: Path, runner: Runner = shell_runner) -> Mani
         manifest.steps.append(
             StepRecord(step.name, step.command, code, time.monotonic() - start, log.name)
         )
+        if results.is_dir():
+            shutil.copytree(results, out / "results", dirs_exist_ok=True)
         manifest.write(out)
         print(f"=== {step.name}: exit {code}", flush=True)
-    results = ROOT / "results"
-    if results.is_dir():
-        shutil.copytree(results, out / "results", dirs_exist_ok=True)
     return manifest
 
 

@@ -30,6 +30,7 @@ from kvkernels.reference.attention import (
     attention_ref32,
     merge_states_ref,
 )
+from kvkernels.tolerance import assert_close
 
 INTERPRETING = os.environ.get("TRITON_INTERPRET") == "1"
 DEVICE = "cpu" if INTERPRETING else "cuda"
@@ -62,8 +63,11 @@ def outputs(
 def check(out: torch.Tensor, lse_out: torch.Tensor, o: torch.Tensor, lse: torch.Tensor) -> None:
     ref, ref_lse = merge_states_ref(o, lse)
     assert not torch.isnan(out).any() and not torch.isnan(lse_out).any()
-    tol = 1e-5 if out.dtype == torch.float32 else 2e-3
-    torch.testing.assert_close(out.float(), ref, rtol=tol, atol=tol)
+    if out.dtype == torch.float32:
+        torch.testing.assert_close(out, ref, rtol=1e-5, atol=1e-5)
+    else:
+        # The low-precision reference is the fp32 answer rounded to the output dtype.
+        assert_close(out, ref.to(out.dtype), ref)
     torch.testing.assert_close(lse_out, ref_lse, rtol=1e-5, atol=1e-5)
 
 

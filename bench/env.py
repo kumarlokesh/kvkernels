@@ -7,6 +7,7 @@ import os
 import shutil
 import socket
 import subprocess
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -89,8 +90,33 @@ def other_compute_pids(index: int = 0) -> list[int]:
     return [pid for pid in parse_compute_pids(out) if pid != os.getpid()]
 
 
+# One small kernel for Nsight Compute to profile.
+COUNTER_PROBE = "import torch; torch.ones(8, device='cuda').add_(1); torch.cuda.synchronize()"
+
+
+def counter_probe_result(returncode: int, output: str) -> bool | None:
+    """Whether ncu was refused counter access, from its exit code and output; None if unclear."""
+    if "ERR_NVGPUCTRPERM" in output:
+        return True
+    return False if returncode == 0 else None
+
+
 def counters_restricted() -> bool | None:
-    """Whether Nsight Compute will be refused counter access; None if unknown."""
+    """Whether Nsight Compute will be refused counter access; None if unknown.
+
+    With ncu on PATH, this profiles one small kernel and looks for
+    ERR_NVGPUCTRPERM. The driver setting alone is not enough: inside a container
+    (a Kaggle notebook) root is refused when the container lacks the host's
+    permission. Without ncu, it falls back to the driver setting.
+    """
+    ncu = shutil.which("ncu")
+    if ncu is not None:
+        cmd = [ncu, "--metrics", "gpu__time_duration.sum", sys.executable, "-c", COUNTER_PROBE]
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        except subprocess.TimeoutExpired:
+            return None
+        return counter_probe_result(proc.returncode, proc.stdout + proc.stderr)
     if not NVIDIA_PARAMS.exists():
         return None
     return profiling_restricted(NVIDIA_PARAMS.read_text(), os.geteuid())

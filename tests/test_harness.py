@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
+import time
 from collections.abc import Callable, Iterator
 
 import pytest
@@ -115,6 +116,57 @@ def test_wrong_implementation_stops_the_suite() -> None:
             measured_peak_gbps=None,
             timer=fixed_timer(),
         )
+
+
+def test_a_case_out_of_gpu_memory_is_left_out_and_the_suite_goes_on() -> None:
+    def good(t: Tensors) -> None:
+        t["dst"].copy_(t["src"])
+
+    def too_big(t: Tensors) -> None:
+        raise torch.OutOfMemoryError("CUDA out of memory. Tried to allocate 8.00 GiB.\nmore")
+
+    big = dataclasses.replace(copy_case({"ref": good, "big": too_big}), params={"bytes": 8})
+    result = harness.run_suite(
+        "t",
+        [big, copy_case()],
+        None,
+        env=ENV,
+        git_sha="x",
+        flush_bytes=1,
+        measured_peak_gbps=None,
+        timer=fixed_timer([1.0] * 100, [2.0] * 100),
+    )
+    assert [m.impl for m in result.measurements] == ["ref", "other"]
+    assert [lo.params for lo in result.left_out] == [{"bytes": 8}]
+    assert result.left_out[0].reason == (
+        "out of GPU memory: CUDA out of memory. Tried to allocate 8.00 GiB."
+    )
+
+
+def test_git_sha_comes_from_the_environment_when_set(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("KVKERNELS_GIT_SHA", "dirty-0123abc")
+    assert harness.git_sha() == "dirty-0123abc"
+
+
+def test_host_cost_stops_at_the_call_count_or_the_time_limit() -> None:
+    calls = 0
+
+    def impl(t: Tensors) -> None:
+        nonlocal calls
+        calls += 1
+
+    harness.host_us_per_call(impl, {}, calls=50)
+    assert calls == 1 + 50  # one call before timing starts
+
+    def slow(t: Tensors) -> None:
+        nonlocal calls
+        calls += 1
+        time.sleep(0.01)
+
+    calls = 0
+    host_us = harness.host_us_per_call(slow, {}, calls=1000, seconds=0.05)
+    assert 1 + 1 <= calls < 1 + 1000
+    assert host_us >= 10_000
 
 
 def test_tolerance_check_needs_fp32_reference() -> None:

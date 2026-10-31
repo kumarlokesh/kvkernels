@@ -74,11 +74,11 @@ GPU tests pass):
 uv run python scripts/gpu_session.py run --out session/
 ```
 
-On a free Kaggle GPU (T4 or L4), from a development machine, with the Kaggle CLI
+On a free Kaggle GPU (Tesla T4), from a development machine, with the Kaggle CLI
 and an API token:
 
 ```bash
-python scripts/kaggle_session.py push --user <kaggle-name> --accelerator NvidiaL4
+python scripts/kaggle_session.py push --user <kaggle-name>
 python scripts/kaggle_session.py status --user <kaggle-name>
 python scripts/kaggle_session.py fetch --user <kaggle-name>
 python scripts/gpu_session.py collect gpu-sessions/kaggle/<time>/session

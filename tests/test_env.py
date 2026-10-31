@@ -5,6 +5,7 @@ import hashlib
 import pytest
 
 from bench.env import (
+    counter_probe_result,
     hostname_hash,
     parse_compute_pids,
     parse_smi_gpu,
@@ -52,6 +53,13 @@ def test_hostname_is_hashed() -> None:
 )
 def test_profiling_restricted(params: str, euid: int, restricted: bool) -> None:
     assert profiling_restricted(params, euid) is restricted
+
+
+def test_counter_probe_reads_the_refusal_from_ncu_output() -> None:
+    refused = "==ERROR== ERR_NVGPUCTRPERM - The user does not have permission"
+    assert counter_probe_result(1, refused) is True
+    assert counter_probe_result(0, "==PROF== Disconnected from process 154") is False
+    assert counter_probe_result(1, "==ERROR== something else") is None
 
 
 @pytest.mark.parametrize(

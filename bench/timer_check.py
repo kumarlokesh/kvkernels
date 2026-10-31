@@ -204,11 +204,20 @@ def ncu_us(probe: str) -> float:
         "--ncu-target",
         probe,
     ]
-    out = subprocess.run(cmd, check=True, capture_output=True, text=True).stdout
+    out = run_ncu(cmd)
     durations = parse_ncu_durations_ns(out)
     if len(durations) < NCU_LAUNCHES // 2:
         raise RuntimeError(f"ncu reported {len(durations)} launches for {probe}; output:\n{out}")
     return statistics.median(durations) / 1e3
+
+
+def run_ncu(cmd: list[str]) -> str:
+    """ncu's stdout; if ncu fails, an error that carries the end of its output."""
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    if proc.returncode != 0:
+        tail = "\n".join((proc.stdout + proc.stderr).splitlines()[-30:])
+        raise RuntimeError(f"ncu exited with {proc.returncode}:\n{tail}")
+    return proc.stdout
 
 
 def ncu_target(probe: str) -> None:

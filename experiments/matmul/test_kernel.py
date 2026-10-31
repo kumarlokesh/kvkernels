@@ -27,9 +27,11 @@ import torch
 
 from experiments.matmul.reference import (
     K_STEP,
+    kernel_k_step,
     matmul_fp16acc_ref_low,
     matmul_ref32,
     matmul_ref_low,
+    to_fp16,
 )
 from kvkernels.tolerance import assert_close, max_abs_error
 
@@ -98,6 +100,27 @@ def test_fp16acc_reference_with_one_slice_is_one_rounding() -> None:
     assert torch.equal(matmul_fp16acc_ref_low(a, b), expected)
 
 
+def test_rounding_toward_zero_differs_from_nearest_only_past_half_a_step() -> None:
+    step = 2**-10  # fp16 spacing between 1 and 2
+    inf = float("inf")
+    x = torch.tensor([1 + step / 4, 1 + 3 * step / 4, -(1 + 3 * step / 4), 3.0, 0.0, 1e6, -1e6])
+    nearest = torch.tensor([1.0, 1 + step, -(1 + step), 3.0, 0.0, inf, -inf])
+    zero = torch.tensor([1.0, 1.0, -1.0, 3.0, 0.0, 65504.0, -65504.0])
+    assert torch.equal(to_fp16(x), nearest.half())
+    assert torch.equal(to_fp16(x, toward_zero=True), zero.half())
+
+
+def test_fp16acc_reference_rounding_every_step_of_one_matches_a_python_loop() -> None:
+    a, b, _ = operands(2, 3, 20, torch.float16)
+    for toward_zero in (False, True):
+        expected = torch.zeros((2, 3), dtype=torch.float16)
+        for i in range(20):
+            partial = a[:, i : i + 1].float().cpu() @ b[i : i + 1].float().cpu()
+            expected = to_fp16(expected.float() + partial, toward_zero=toward_zero)
+        got = matmul_fp16acc_ref_low(a, b, k_step=1, toward_zero=toward_zero).cpu()
+        assert torch.equal(got, expected)
+
+
 def test_fp16acc_reference_loses_more_than_fp32_accumulation() -> None:
     # Many fp16 roundings of a growing sum cost more than one rounding at the end.
     a, b, _ = operands(64, 64, 2048, torch.float16)
@@ -137,7 +160,8 @@ def test_fp16_accumulation_matches_its_reference(shape: tuple[int, int, int]) ->
     kernel = kernel_module()
     a, b, out = operands(*shape, torch.float16)
     kernel.matmul(a, b, out, fp16_accumulate=True)
-    assert_close(out, matmul_fp16acc_ref_low(a, b), matmul_ref32(a, b))
+    ref_low = matmul_fp16acc_ref_low(a, b, k_step=kernel_k_step(a.device))
+    assert_close(out, ref_low, matmul_ref32(a, b))
 
 
 @needs_kernel_runtime
@@ -200,7 +224,8 @@ def test_fp16_accumulation_full_size(size: int) -> None:
     kernel = kernel_module()
     a, b, out = operands(size, size, size, torch.float16)
     kernel.matmul(a, b, out, fp16_accumulate=True)
-    assert_close(out, matmul_fp16acc_ref_low(a, b), matmul_ref32(a, b))
+    ref_low = matmul_fp16acc_ref_low(a, b, k_step=kernel_k_step(a.device))
+    assert_close(out, ref_low, matmul_ref32(a, b))
 
 
 # --- the benchmark suite (no kernel needed) --------------------------------------

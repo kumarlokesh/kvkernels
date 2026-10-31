@@ -54,6 +54,14 @@ class Measurement:
 
 
 @dataclass(frozen=True)
+class LeftOut:
+    """A case the run could not measure, such as one that does not fit in GPU memory."""
+
+    params: Params
+    reason: str
+
+
+@dataclass(frozen=True)
 class BenchResult:
     schema_version: int
     suite: str
@@ -64,6 +72,7 @@ class BenchResult:
     env: EnvInfo
     measured_peak_gbps: float | None
     measurements: list[Measurement]
+    left_out: list[LeftOut]
 
 
 class SchemaError(ValueError):

@@ -16,6 +16,17 @@ from scripts import gpu_session, kaggle_session
 def test_env_always_runs_first() -> None:
     names = [s.name for s in gpu_session.select(["cascade", "test-gpu"])]
     assert names == ["env", "test-gpu", "cascade"]
+
+
+def test_a_result_step_brings_the_tests_it_needs() -> None:
+    assert [s.name for s in gpu_session.select(["kv_gather"])] == ["env", "test-gpu", "kv_gather"]
+    assert [s.name for s in gpu_session.select(["matmul"])] == [
+        "env",
+        "test-gpu",
+        "test-gpu-experiments",
+        "matmul",
+    ]
+    assert all(s.needs for s in gpu_session.STEPS if s.writes_results)
     assert [s.name for s in gpu_session.select(None)] == list(gpu_session.STEP_NAMES)
     with pytest.raises(ValueError, match="nonsense"):
         gpu_session.select(["nonsense"])
@@ -30,6 +41,16 @@ def fake_runner(exit_codes: dict[str, int]) -> gpu_session.Runner:
     return run
 
 
+def test_experiment_suites_are_skipped_when_only_the_experiment_tests_fail(
+    tmp_path: Path,
+) -> None:
+    steps = gpu_session.select(["kv_gather", "matmul"])
+    manifest = gpu_session.run(steps, tmp_path, fake_runner({"test-gpu-experiments": 1}))
+    by_name = {s.name: s for s in manifest.steps}
+    assert by_name["kv_gather"].returncode == 0
+    assert by_name["matmul"].skipped == "test-gpu-experiments did not pass"
+
+
 def test_result_steps_are_skipped_when_the_gpu_tests_fail(tmp_path: Path) -> None:
     steps = gpu_session.select(["test-gpu", "kv_gather", "old-torch"])
     manifest = gpu_session.run(steps, tmp_path, fake_runner({"test-gpu": 1}))
@@ -39,6 +60,24 @@ def test_result_steps_are_skipped_when_the_gpu_tests_fail(tmp_path: Path) -> Non
     assert by_name["old-torch"].returncode == 0  # writes no results, so it still runs
     saved = gpu_session.Manifest.read(tmp_path)
     assert [s.name for s in saved.steps] == ["env", "test-gpu", "kv_gather", "old-torch"]
+
+
+def test_results_are_copied_after_each_step(tmp_path: Path) -> None:
+    out, results = tmp_path / "session", tmp_path / "results"
+    seen_before_kv_gather: list[bool] = []
+
+    def runner(command: str, log: Path) -> int:
+        step = next(s for s in gpu_session.STEPS if s.command == command)
+        log.write_text("")
+        if step.name == "smoke":
+            (results / "t4" / "smoke").mkdir(parents=True)
+            (results / "t4" / "smoke" / "x.json").write_text("{}\n")
+        if step.name == "kv_gather":
+            seen_before_kv_gather.append((out / "results" / "t4" / "smoke" / "x.json").exists())
+        return 0
+
+    gpu_session.run(gpu_session.select(["smoke", "kv_gather"]), out, runner, results)
+    assert seen_before_kv_gather == [True]
 
 
 def write_session(path: Path, test_gpu_code: int) -> None:
@@ -63,10 +102,10 @@ def test_nothing_runs_without_a_gpu(tmp_path: Path) -> None:
     assert all(s.skipped for s in manifest.steps[1:])
 
 
-def test_both_test_steps_require_a_gpu() -> None:
+def test_every_test_step_requires_a_gpu() -> None:
     commands = {s.name: s.command for s in gpu_session.STEPS}
-    assert "KVKERNELS_REQUIRE_GPU=1" in commands["test-gpu"]
-    assert "KVKERNELS_REQUIRE_GPU=1" in commands["old-torch"]
+    for name in ("test-gpu", "test-gpu-experiments", "old-torch"):
+        assert "KVKERNELS_REQUIRE_GPU=1" in commands[name]
 
 
 def test_collect_copies_results_and_the_env_report(tmp_path: Path) -> None:
@@ -98,14 +137,14 @@ def test_bundle_holds_the_code_and_no_documents() -> None:
 
 
 def test_kernel_is_private_with_gpu_and_internet() -> None:
-    meta = kaggle_session.kernel_metadata("someone", "NvidiaL4")
+    meta = kaggle_session.kernel_metadata("someone", "NvidiaTeslaT4")
     assert meta["id"] == "someone/kvkernels-gpu-session"
     assert (meta["is_private"], meta["enable_gpu"], meta["enable_internet"]) == (
         "true",
         "true",
         "true",
     )
-    assert meta["machine_shape"] == "NvidiaL4"
+    assert meta["machine_shape"] == "NvidiaTeslaT4"
     assert meta["dataset_sources"] == []  # the source travels inside the script
 
 
@@ -121,5 +160,16 @@ def test_run_script_is_valid_python_and_carries_the_bundle() -> None:
         and isinstance(node.value, ast.Constant)
     }
     assert values["STEPS"] == "env,test-gpu"
+    assert values["GIT_SHA"] == "unknown"
     assert base64.b64decode(values["BUNDLE"]) == bundle
     assert "STEPS = ''" in kaggle_session.run_script(None, b"")
+    with_command = kaggle_session.run_script(None, b"", "python -m experiments.matmul.x")
+    assert "COMMAND = 'python -m experiments.matmul.x'" in with_command
+    ast.parse(with_command)
+
+
+def test_push_passes_the_command_through(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[tuple[object, ...]] = []
+    monkeypatch.setattr(kaggle_session, "push", lambda *args: calls.append(args))
+    kaggle_session.main(["push", "--user", "someone", "--command", "python -m x"])
+    assert calls == [("someone", "NvidiaTeslaT4", None, kaggle_session.MAX_SECONDS, "python -m x")]
