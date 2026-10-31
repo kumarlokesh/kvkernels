@@ -1,0 +1,16 @@
+$ uv run python scripts/env_report.py
+Error in sitecustomize; set PYTHONVERBOSE for traceback:
+ModuleNotFoundError: No module named 'wrapt'
+gpu_name         Tesla T4
+gpu_slug         t4
+driver_version   580.178.04
+cuda_version     12.6
+torch_version    2.14.1+cu126
+triton_version   3.8.0
+sm_clock_mhz     300
+mem_clock_mhz    405
+hostname_hash    6b3316574b54bcdd1955317cc4fab89eef6c5e2a94d530c05c68738d2b459bc6
+spec             t4
+other_processes  none
+perf_counters    RESTRICTED: Nsight Compute will fail with ERR_NVGPUCTRPERM
+                 kernel profiling needs a provider that allows counter access

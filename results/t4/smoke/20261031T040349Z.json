@@ -1,0 +1,83 @@
+{
+  "created_utc": "2026-10-31T04:03:49Z",
+  "env": {
+    "cuda_version": "12.6",
+    "driver_version": "580.178.04",
+    "gpu_name": "Tesla T4",
+    "gpu_slug": "t4",
+    "hostname_hash": "6b3316574b54bcdd1955317cc4fab89eef6c5e2a94d530c05c68738d2b459bc6",
+    "mem_clock_mhz": 5000,
+    "sm_clock_mhz": 870,
+    "torch_version": "2.14.1+cu126",
+    "triton_version": "3.8.0"
+  },
+  "flush_bytes": 268435456,
+  "git_sha": "dirty-615f2a832aa84b4f591844f4a8ee0ec6a5e330c1",
+  "left_out": [],
+  "measured_peak_gbps": 236.21896609193303,
+  "measurements": [
+    {
+      "bytes_moved": 134217728,
+      "flops": null,
+      "gbps": 234.4365442111199,
+      "host_us": null,
+      "impl": "torch_copy",
+      "median_ms": 0.5725119709968567,
+      "noisy": false,
+      "p10_ms": 0.5713535904884338,
+      "p90_ms": 0.5758399963378906,
+      "params": {
+        "bytes": 67108864
+      },
+      "pct_datasheet_bw": 0.7326142006597497,
+      "pct_measured_bw": 0.992454365920307,
+      "pct_peak_compute": null,
+      "plan_us": null,
+      "samples": 115,
+      "tflops": null
+    },
+    {
+      "bytes_moved": 536870912,
+      "flops": null,
+      "gbps": 236.099290222151,
+      "host_us": null,
+      "impl": "torch_copy",
+      "median_ms": 2.2739200592041016,
+      "noisy": false,
+      "p10_ms": 2.2686336517333983,
+      "p90_ms": 2.277452802658081,
+      "params": {
+        "bytes": 268435456
+      },
+      "pct_datasheet_bw": 0.7378102819442219,
+      "pct_measured_bw": 0.9994933689205319,
+      "pct_peak_compute": null,
+      "plan_us": null,
+      "samples": 123,
+      "tflops": null
+    },
+    {
+      "bytes_moved": 2147483648,
+      "flops": null,
+      "gbps": 236.86679977603453,
+      "host_us": null,
+      "impl": "torch_copy",
+      "median_ms": 9.066207885742188,
+      "noisy": false,
+      "p10_ms": 9.058086585998534,
+      "p90_ms": 9.083193969726562,
+      "params": {
+        "bytes": 1073741824
+      },
+      "pct_datasheet_bw": 0.7402087493001079,
+      "pct_measured_bw": 1.002742513418035,
+      "pct_peak_compute": null,
+      "plan_us": null,
+      "samples": 123,
+      "tflops": null
+    }
+  ],
+  "schema_version": 1,
+  "suite": "smoke",
+  "timer": "do_bench-cold-l2"
+}
