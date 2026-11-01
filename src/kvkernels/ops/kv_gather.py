@@ -38,11 +38,24 @@ import torch
 import triton
 import triton.language as tl
 
-_WORD_DTYPES: dict[int, torch.dtype] = {
-    8: torch.int64,
-    4: torch.int32,
-    2: torch.int16,
-    1: torch.uint8,
+from kvkernels.ops._registry import registered_op
+
+# The integer type the kernel copies in, by word width in bytes.
+_WORD_TYPES = {8: tl.int64, 4: tl.int32, 2: tl.int16, 1: tl.uint8}
+
+# Element types the kernel can take as they are: it reinterprets their pointers as
+# words. Others (fp8) are passed as a uint8 view, since Triton rejects some fp8
+# types as kernel arguments on GPUs without fp8 support.
+_DIRECT_DTYPES = {
+    torch.float16,
+    torch.bfloat16,
+    torch.float32,
+    torch.float64,
+    torch.int8,
+    torch.int16,
+    torch.int32,
+    torch.int64,
+    torch.uint8,
 }
 
 # CUDA allows at most 65,535 programs on grid axes 1 and 2.
@@ -80,9 +93,12 @@ def _copy_blocks_kernel(  # type: ignore[no-untyped-def]
     block_words,
     IDS_INDEX_SRC: tl.constexpr,
     ALIGN: tl.constexpr,
+    WORD: tl.constexpr,
     TILE: tl.constexpr,
 ):
-    """Copy tile `program_id(1)` of one block. Strides and sizes are in words."""
+    """Copy tile `program_id(1)` of one block. Strides and sizes are in words of type WORD."""
+    src_ptr = src_ptr.to(tl.pointer_type(WORD), bitcast=True)
+    dst_ptr = dst_ptr.to(tl.pointer_type(WORD), bitcast=True)
     row = tl.program_id(0).to(tl.int64)
     tile = tl.program_id(1)
     # 64-bit, because block id · block stride can pass 2**31 words.
@@ -147,10 +163,11 @@ def _word_bytes(*sizes_and_addresses: int) -> int:
     return 1
 
 
-def _as_words(t: torch.Tensor, width: int) -> torch.Tensor:
-    """View t as [blocks, words per block] of a `width`-byte integer type, without copying."""
-    rows = t.view(t.shape[0], -1)
-    return rows.view(torch.uint8).view(_WORD_DTYPES[width])
+def _kernel_arg(t: torch.Tensor) -> torch.Tensor:
+    """t itself, or for an element type the kernel cannot take, a uint8 view of t."""
+    if t.dtype in _DIRECT_DTYPES:
+        return t
+    return t.view(t.shape[0], -1).view(torch.uint8)
 
 
 def _num_ids(block_ids: torch.Tensor) -> int:
@@ -207,48 +224,51 @@ def _validate_ids(planes: Sequence[torch.Tensor], block_ids: torch.Tensor, uniqu
         raise ValueError("block_ids has a repeated id; scatter needs distinct ids")
 
 
+# The tile the autotuner chose, by (words per block, word width, source dtype,
+# destination dtype). Later calls launch the kernel directly with it, which skips
+# the autotuner's own per-call work.
+_TUNED: dict[tuple[int, int, torch.dtype, torch.dtype], triton.Config] = {}
+
+
 def _copy_plane(
     plane: torch.Tensor, rows: torch.Tensor, block_ids: torch.Tensor, gather: bool
 ) -> None:
-    block_bytes = _block_numel(plane) * plane.element_size()
-    stride_bytes = plane.stride(0) * plane.element_size()
+    element = plane.element_size()
+    block_bytes = _block_numel(plane) * element
+    stride_bytes = plane.stride(0) * element
     layout = (block_bytes, stride_bytes, plane.data_ptr(), rows.data_ptr())
     width = _word_bytes(*layout)
-    plane_words = _as_words(plane, width)
-    row_words = _as_words(rows, width)
     block_words = block_bytes // width
+    # rows is contiguous, so its blocks are block_bytes apart.
+    plane_arg, plane_stride = _kernel_arg(plane), stride_bytes // width
+    rows_arg, rows_stride = _kernel_arg(rows), block_bytes // width
     # When every block start is 16-byte aligned (which implies 8-byte words),
     # tell the compiler that strides are multiples of two words.
     align = 16 // width if all(x % 16 == 0 for x in layout) else 1
-    src, dst = (plane_words, row_words) if gather else (row_words, plane_words)
+    if gather:
+        args = (plane_arg, rows_arg, block_ids, plane_stride, rows_stride, block_words)
+    else:
+        args = (rows_arg, plane_arg, block_ids, rows_stride, plane_stride, block_words)
+    meta = {"IDS_INDEX_SRC": gather, "ALIGN": align, "WORD": _WORD_TYPES[width]}
     num_ids = block_ids.shape[0]
     if _interpreting():
         fixed_grid = (num_ids, triton.cdiv(block_words, _INTERPRETER_TILE))
-        _copy_blocks_kernel[fixed_grid](
-            src,
-            dst,
-            block_ids,
-            src.stride(0),
-            dst.stride(0),
-            block_words,
-            IDS_INDEX_SRC=gather,
-            ALIGN=align,
-            TILE=_INTERPRETER_TILE,
-        )
+        _copy_blocks_kernel[fixed_grid](*args, **meta, TILE=_INTERPRETER_TILE)
         return
 
-    def grid(meta: dict[str, int]) -> tuple[int, int]:
-        return (num_ids, triton.cdiv(block_words, meta["TILE"]))
+    key = (block_words, width, args[0].dtype, args[1].dtype)
+    config = _TUNED.get(key)
+    if config is None:
 
-    _copy_blocks_autotuned[grid](
-        src,
-        dst,
-        block_ids,
-        src.stride(0),
-        dst.stride(0),
-        block_words,
-        IDS_INDEX_SRC=gather,
-        ALIGN=align,
+        def grid(meta: dict[str, int]) -> tuple[int, int]:
+            return (num_ids, triton.cdiv(block_words, meta["TILE"]))
+
+        _copy_blocks_autotuned[grid](*args, **meta)
+        _TUNED[key] = _copy_blocks_autotuned.best_config
+        return
+    tile = int(config.kwargs["TILE"])
+    _copy_blocks_kernel[(num_ids, triton.cdiv(block_words, tile))](
+        *args, **meta, TILE=tile, num_warps=config.num_warps, num_stages=config.num_stages
     )
 
 
@@ -261,9 +281,8 @@ def _check_tiles(planes: Sequence[torch.Tensor]) -> None:
             raise ValueError(f"plane {p}: a block of {block_bytes} bytes is too large")
 
 
-# Registered as PyTorch custom ops, so torch.compile and engines treat each call as one
-# opaque operation that writes into the tensors named in mutates_args.
-@torch.library.custom_op("kvkernels::gather_kv_blocks", mutates_args=("outs",))
+# Registered as PyTorch custom ops; eager calls skip the dispatch (kvkernels.ops._registry).
+@registered_op("kvkernels::gather_kv_blocks", mutates_args=("outs",))
 def _gather_op(
     planes: list[torch.Tensor], block_ids: torch.Tensor, outs: list[torch.Tensor], validate: bool
 ) -> None:
@@ -286,7 +305,7 @@ def _gather_fake(
     return None
 
 
-@torch.library.custom_op("kvkernels::scatter_kv_blocks", mutates_args=("planes",))
+@registered_op("kvkernels::scatter_kv_blocks", mutates_args=("planes",))
 def _scatter_op(
     srcs: list[torch.Tensor], block_ids: torch.Tensor, planes: list[torch.Tensor], validate: bool
 ) -> None:

@@ -28,6 +28,8 @@ import torch
 import triton
 import triton.language as tl
 
+from kvkernels.ops._registry import registered_op
+
 _OUT_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 _MAX_HEAD_DIM = 256
 
@@ -241,7 +243,7 @@ def _lse_args(lse_out: torch.Tensor | None, out: torch.Tensor) -> tuple[torch.Te
     return lse_out, lse_out.stride(0), lse_out.stride(1)
 
 
-@torch.library.custom_op("kvkernels::merge_attention_states_n", mutates_args=("out", "lse_out"))
+@registered_op("kvkernels::merge_attention_states_n", mutates_args=("out", "lse_out"))
 def _merge_n_op(
     o: torch.Tensor, lse: torch.Tensor, out: torch.Tensor, lse_out: torch.Tensor | None
 ) -> None:
@@ -283,7 +285,7 @@ def _merge_n_fake(
     return None
 
 
-@torch.library.custom_op("kvkernels::merge_attention_states", mutates_args=("out", "lse_out"))
+@registered_op("kvkernels::merge_attention_states", mutates_args=("out", "lse_out"))
 def _merge_two_op(
     o_a: torch.Tensor,
     lse_a: torch.Tensor,

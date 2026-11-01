@@ -55,6 +55,9 @@ WARMUP_MS = 25  # covers compilation and autotuning
 REP_MS = 200  # gives at least MIN_SAMPLES for kernels under about 1 ms
 MIN_SAMPLES = 100
 MAX_SPREAD = 1.10  # p90 / median above this marks a case as noisy
+# ... unless p90 is within this of the median: for kernels of a few microseconds,
+# that gap is the resolution of the CUDA event timer (about 0.5 us per event).
+MIN_NOISE_MS = 0.002
 EXTRA_RUNS = 2  # reruns allowed for a noisy case
 HOST_CALLS = 1000  # calls averaged for the CPU cost per call
 HOST_SECONDS = 1.0  # or fewer calls, once this much time has passed
@@ -78,6 +81,14 @@ class Case:
     # Per implementation: host preparation run on the inputs before the
     # implementation and never timed with it (see the module docstring).
     plans: Mapping[str, Impl] | None = None
+    # Per implementation: its own inputs, for one that needs tensors the others do
+    # not; the outputs must match setup's.
+    setups: Mapping[str, Callable[[], Tensors]] | None = None
+
+    def setup_for(self, impl: str) -> Tensors:
+        if self.setups and impl in self.setups:
+            return self.setups[impl]()
+        return self.setup()
 
     def prepared(self, impl: str, inputs: Tensors) -> Tensors:
         """Run the implementation's plan on inputs, if it has one, and return them."""
@@ -100,6 +111,10 @@ class Timing:
     @property
     def spread(self) -> float:
         return self.p90_ms / self.median_ms if self.median_ms > 0 else float("inf")
+
+    @property
+    def noisy(self) -> bool:
+        return self.spread > MAX_SPREAD and self.p90_ms - self.median_ms > MIN_NOISE_MS
 
 
 def summarize(times_ms: Sequence[float]) -> Timing:
@@ -134,12 +149,12 @@ def time_with_reruns(fn: Callable[[], None], timer: Timer) -> tuple[Timing, bool
     """Time fn; rerun a noisy case and keep the run with the lowest spread."""
     best = summarize(timed_samples(fn, timer))
     for _ in range(EXTRA_RUNS):
-        if best.spread <= MAX_SPREAD:
+        if not best.noisy:
             break
         again = summarize(timed_samples(fn, timer))
         if again.spread < best.spread:
             best = again
-    return best, best.spread > MAX_SPREAD
+    return best, best.noisy
 
 
 def host_us_per_call(
@@ -209,7 +224,7 @@ def check_case(case: Case) -> None:
     def outputs_on_host(inputs: Tensors) -> Tensors:
         return {out: inputs[out].cpu() for out in case.outputs}
 
-    ref_inputs = case.prepared(names[0], case.setup())
+    ref_inputs = case.prepared(names[0], case.setup_for(names[0]))
     case.impls[names[0]](ref_inputs)
     ref = outputs_on_host(ref_inputs)
     del ref_inputs
@@ -220,7 +235,7 @@ def check_case(case: Case) -> None:
     )
 
     for name in names[1:]:
-        inputs = case.prepared(name, case.setup())
+        inputs = case.prepared(name, case.setup_for(name))
         case.impls[name](inputs)
         got = outputs_on_host(inputs)
         del inputs
@@ -341,7 +356,7 @@ def _run_case(
     check_case(case)
     measurements = []
     for impl_name, impl in case.impls.items():
-        inputs = case.prepared(impl_name, case.setup())
+        inputs = case.prepared(impl_name, case.setup_for(impl_name))
         timing, noisy = time_with_reruns(functools.partial(impl, inputs), timer)
         host_us = (
             host_us_per_call(impl, case.prepared(impl_name, case.host_setup()))

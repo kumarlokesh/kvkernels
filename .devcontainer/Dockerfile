@@ -26,5 +26,8 @@ RUN set -eux; \
     pip install --no-cache-dir uv==0.13.5
 
 # Keep the Linux virtual environment out of the workspace, which the host shares.
+# uv run uses the environment `make install` built, and never swaps its CPU torch
+# for PyPI's (see the Makefile).
 ENV UV_PROJECT_ENVIRONMENT=/opt/venv \
-    UV_LINK_MODE=copy
+    UV_LINK_MODE=copy \
+    UV_NO_SYNC=1

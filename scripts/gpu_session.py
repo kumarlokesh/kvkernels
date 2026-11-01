@@ -162,7 +162,8 @@ def shell_runner(command: str, log: Path) -> int:
             shell=True,
             cwd=ROOT,
             # A pipe makes Python buffer its output; unbuffered, the log shows progress live.
-            env={**os.environ, "PYTHONUNBUFFERED": "1"},
+            # UV_NO_SYNC: uv run keeps the installed CUDA torch (see the Makefile).
+            env={**os.environ, "PYTHONUNBUFFERED": "1", "UV_NO_SYNC": "1"},
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,

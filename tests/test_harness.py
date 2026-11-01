@@ -97,6 +97,14 @@ def test_noisy_case_that_settles_is_not_flagged() -> None:
     assert not noisy
 
 
+def test_a_high_spread_within_the_timer_resolution_is_not_noisy() -> None:
+    # A 5 us kernel whose p90 is 1 us above its median: spread 1.2, gap 0.001 ms.
+    timer = fixed_timer([0.005] * 80 + [0.006] * 20)
+    timing, noisy = harness.time_with_reruns(lambda: None, timer)
+    assert timing.spread == pytest.approx(1.2)
+    assert not noisy
+
+
 def test_wrong_implementation_stops_the_suite() -> None:
     def good(t: Tensors) -> None:
         t["dst"].copy_(t["src"])
@@ -167,6 +175,24 @@ def test_host_cost_stops_at_the_call_count_or_the_time_limit() -> None:
     host_us = harness.host_us_per_call(slow, {}, calls=1000, seconds=0.05)
     assert 1 + 1 <= calls < 1 + 1000
     assert host_us >= 10_000
+
+
+def test_an_implementation_with_its_own_setup_gets_its_own_inputs() -> None:
+    seen: dict[str, set[str]] = {}
+
+    def record(name: str) -> Callable[[Tensors], None]:
+        def impl(t: Tensors) -> None:
+            seen.setdefault(name, set()).update(t)
+            t["dst"].copy_(t["src"])
+
+        return impl
+
+    def extra() -> Tensors:
+        return {**copy_case().setup(), "extra": torch.zeros(1)}
+
+    case = dataclasses.replace(copy_case({"a": record("a"), "b": record("b")}), setups={"b": extra})
+    harness.check_case(case)
+    assert seen == {"a": {"src", "dst"}, "b": {"src", "dst", "extra"}}
 
 
 def test_tolerance_check_needs_fp32_reference() -> None:

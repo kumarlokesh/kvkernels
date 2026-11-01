@@ -133,6 +133,8 @@ if sh("nvidia-smi"):
     sys.exit("no GPU attached")
 if sh("pip install -q uv==0.13.5") or sh(INSTALL):
     sys.exit("environment install failed")
+# uv run keeps the CUDA torch just installed instead of syncing to PyPI's.
+os.environ["UV_NO_SYNC"] = "1"
 
 # FlashInfer links the kernels it compiles with -lcuda, and the image has no
 # unversioned libcuda.so, so give the linker one: a link to the driver library

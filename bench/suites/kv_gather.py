@@ -83,11 +83,15 @@ def _element_size(dtype: str) -> int:
     return {"float16": 2, "bfloat16": 2, "float32": 4}[dtype]
 
 
-def make_inputs(params: Params, *, tiny_blocks: bool = False, device: str = "cuda") -> Tensors:
+def make_inputs(
+    params: Params, *, tiny_blocks: bool = False, contiguous: bool = False, device: str = "cuda"
+) -> Tensors:
     """Deterministic inputs: the same params always give the same bytes and ids.
 
     tiny_blocks keeps the number of ids but shrinks every block to 32 bytes, for
-    measuring the host cost of a call without waiting on the GPU.
+    measuring the host cost of a call without waiting on the GPU. contiguous adds
+    the gathered blocks as one contiguous tensor, the source copy_ceiling reads;
+    only copy_ceiling gets it, so the other gathers' largest cases fit in memory.
     """
     import torch
 
@@ -121,7 +125,8 @@ def make_inputs(params: Params, *, tiny_blocks: bool = False, device: str = "cud
     inputs: Tensors = {"plane": plane, "ids": ids, "ids_long": ids.long()}
     if params["op"] == "gather":
         inputs["out"] = rows.zero_()
-        inputs["contiguous"] = plane[ids.long()].contiguous()
+        if contiguous or tiny_blocks:  # tiny inputs are small enough to always carry it
+            inputs["contiguous"] = plane[ids.long()].contiguous()
     else:
         rows.view(torch.uint8).random_(0, 256, generator=gen)
         inputs["src"] = rows
@@ -311,6 +316,9 @@ def make_case(params: Params, *, with_dma: bool) -> Case:
         check="exact",
         bytes_moved=bytes_moved,
         host_setup=lambda: make_inputs(params, tiny_blocks=True),
+        setups={"copy_ceiling": lambda: make_inputs(params, contiguous=True)}
+        if op == "gather"
+        else None,
     )
 
 

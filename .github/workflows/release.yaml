@@ -1,0 +1,77 @@
+name: release
+
+# A tag vX.Y.Z checks the release, builds it, installs it in a clean environment,
+# and publishes it to PyPI through trusted publishing: PyPI accepts a short-lived
+# token GitHub issues to this workflow, so no PyPI credential is stored anywhere.
+#
+#   tag ──▶ checks (lint, README, both test rows) ─┐
+#       └─▶ tag (version, changelog) ──────────────┴─▶ build ──▶ publish (PyPI, GitHub release)
+on:
+  push:
+    tags: ["v*"]
+
+env:
+  UV_NO_SYNC: "1"
+
+jobs:
+  checks:
+    uses: ./.github/workflows/ci.yaml
+
+  tag:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          version: "0.13.5"
+          python-version: "3.12"
+      - name: Tag matches the version; the changelog has its section and Tested on line
+        run: python scripts/release_check.py --tag "${GITHUB_REF_NAME}"
+
+  build:
+    needs: [checks, tag]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          version: "0.13.5"
+          python-version: "3.12"
+      - run: uv build
+      - name: Install the wheel alone, next to CPU torch, and run it
+        run: |
+          uv venv -p 3.12 /tmp/clean
+          uv pip install -p /tmp/clean --index-url https://download.pytorch.org/whl/cpu torch
+          uv pip install -p /tmp/clean dist/*.whl
+          # The smoke check runs the ops under Triton's interpreter, which imports numpy.
+          uv pip install -p /tmp/clean numpy
+          /tmp/clean/bin/python scripts/wheel_smoke.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write  # trusted publishing
+      contents: write  # the GitHub release
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          version: "0.13.5"
+          python-version: "3.12"
+      - run: uv publish --trusted-publishing always dist/*
+      - name: GitHub release with the changelog section as its notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python scripts/release_check.py --tag "${GITHUB_REF_NAME}" --notes notes.md
+          gh release create "${GITHUB_REF_NAME}" dist/* --title "${GITHUB_REF_NAME}" --notes-file notes.md

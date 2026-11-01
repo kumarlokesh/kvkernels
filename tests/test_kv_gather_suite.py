@@ -57,6 +57,22 @@ def test_every_op_and_layout_appears() -> None:
     assert seen == {(op, layout) for op in ("gather", "scatter") for layout in suite.BLOCK_SIZES}
 
 
+def test_only_the_plain_copy_gets_the_contiguous_source() -> None:
+    params: Params = {
+        "op": "gather",
+        "layout": "vllm_LBNHC",
+        "block": 16,
+        "kv_heads": 8,
+        "head_dim": 128,
+        "num_ids": 64,
+        "order": "random",
+        "dtype": "float16",
+    }
+    gather = suite.make_case(params, with_dma=False)
+    assert gather.setups is not None and set(gather.setups) == {"copy_ceiling"}
+    assert suite.make_case({**params, "op": "scatter"}, with_dma=False).setups is None
+
+
 @pytest.mark.gpu
 @pytest.mark.parametrize("op", ["gather", "scatter"])
 @pytest.mark.parametrize(

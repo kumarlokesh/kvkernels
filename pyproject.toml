@@ -6,21 +6,32 @@ readme = "README.md"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
 requires-python = ">=3.11"
-# torch and Triton are pinned exactly so that results stay comparable across runs.
+# Ranges, so the package installs next to an engine's own torch: torch 2.13 is the
+# oldest torch of a supported engine release, and Triton 3.7 is what it requires.
 # Triton publishes Linux wheels only.
 dependencies = [
-    "numpy>=1.26",
-    "triton==3.8.0; sys_platform == 'linux'",
+    "torch>=2.13",
+    "triton>=3.7; sys_platform == 'linux'",
 ]
 
 [project.optional-dependencies]
-# Pick exactly one torch build: cpu (devcontainer, CI, macOS) or a CUDA build (GPU machines).
-cpu = ["torch==2.14.1"]
+# The benchmark environment pins torch and Triton exactly, so that results stay
+# comparable across runs. Pick exactly one torch build: cpu (devcontainer, CI, macOS)
+# or a CUDA build (GPU machines).
+cpu = ["torch==2.14.1", "triton==3.8.0; sys_platform == 'linux'"]
 # cuda-bindings reaches the CUDA driver API for the batched-DMA benchmark baseline;
 # its major version matches the torch build's CUDA.
-cu126 = ["torch==2.14.1; sys_platform == 'linux'", "cuda-bindings==12.9.10; sys_platform == 'linux'"]
-cu130 = ["torch==2.14.1; sys_platform == 'linux'", "cuda-bindings==13.4.4; sys_platform == 'linux'"]
-bench = ["matplotlib>=3.8", "pandas>=2.1"]
+cu126 = [
+    "torch==2.14.1; sys_platform == 'linux'",
+    "triton==3.8.0; sys_platform == 'linux'",
+    "cuda-bindings==12.9.10; sys_platform == 'linux'",
+]
+cu130 = [
+    "torch==2.14.1; sys_platform == 'linux'",
+    "triton==3.8.0; sys_platform == 'linux'",
+    "cuda-bindings==13.4.4; sys_platform == 'linux'",
+]
+bench = ["numpy>=1.26", "matplotlib>=3.8", "pandas>=2.1"]
 # Benchmark baselines on GPU machines. FlashInfer compiles its kernels on first use,
 # so the machine also needs the CUDA compiler.
 baselines = ["flashinfer-python==0.7.2; sys_platform == 'linux'"]

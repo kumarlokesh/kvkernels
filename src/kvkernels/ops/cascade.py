@@ -35,6 +35,7 @@ from dataclasses import dataclass
 
 import torch
 
+from kvkernels.ops._registry import registered_op
 from kvkernels.ops.merge_states import merge_ragged
 from kvkernels.ops.prefix_attention import attend
 
@@ -301,9 +302,7 @@ class CascadePlan:
         ]
 
 
-@torch.library.custom_op(
-    "kvkernels::cascade_decode_attention", mutates_args=("workspace", "out", "lse_out")
-)
+@registered_op("kvkernels::cascade_decode_attention", mutates_args=("workspace", "out", "lse_out"))
 def _cascade_op(
     q: torch.Tensor,
     k: torch.Tensor,
