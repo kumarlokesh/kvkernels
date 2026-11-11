@@ -1,27 +1,29 @@
-"""Write the README's results tables from the committed result files.
+"""Write the README's results, their charts, and the full tables, from the result files.
 
-    python scripts/readme_results.py           rewrite README.md
-    python scripts/readme_results.py --check   exit 1 if README.md differs from what
-                                               the result files give
+    python scripts/readme_results.py           rewrite the files below
+    python scripts/readme_results.py --check   exit 1 if any differs from what the
+                                               result files give
 
-Each suite's tables sit between two markers in README.md:
+For each suite and GPU, from the newest file in results/<gpu>/<suite>/:
 
-    <!-- results:<suite>:begin -->
-    one table per GPU, each from the newest file in results/<gpu>/<suite>/,
-    with a line naming the file, GPU, torch, Triton and commit
-    <!-- results:<suite>:end -->
+    README.md, between <!-- results:<suite>:begin/end -->   a one-line summary and a chart
+    figures/<gpu>/<suite>-{light,dark}.svg                  the chart, for each GitHub theme
+    results/README.md                                       the full table, and the file,
+                                                            GPU, torch, Triton and commit
 
-Each table comes from one result file, so numbers from different runs never share
-a table. Text outside the markers is left alone.
+Each chart and table comes from one result file, so numbers from different runs
+never share one. Text outside the markers is left alone.
 """
 
 from __future__ import annotations
 
 import argparse
+import io
 import json
 import re
 import sys
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -101,9 +103,169 @@ def table(header: Sequence[str], rows: Sequence[Sequence[str]]) -> list[str]:
 def source_line(path: Path, result: Result, root: Path) -> str:
     env = result["env"]
     return (
-        f"{env['gpu_name']}, torch {env['torch_version']}, Triton {env['triton_version']},"
-        f" commit `{result['git_sha'][:14]}`; from `{path.relative_to(root).as_posix()}`"
+        f"<sub>{env['gpu_name']}, torch {env['torch_version']}, Triton"
+        f" {env['triton_version']}, commit <code>{result['git_sha'][:14]}</code>; from"
+        f" <code>{path.relative_to(root).as_posix()}</code></sub>"
     )
+
+
+def picture(light: str, dark: str, alt: str) -> str:
+    """A chart that follows GitHub's light or dark theme."""
+    return (
+        f'<picture><source media="(prefers-color-scheme: dark)" srcset="{dark}">'
+        f'<img alt="{alt}" src="{light}" width="720"></picture>'
+    )
+
+
+# Chart colors: one accent for kvkernels, gray for the baselines, on GitHub's page
+# colors. The accent passes the contrast check against both surfaces.
+THEMES = {
+    "light": {
+        "surface": "#ffffff",
+        "ink": "#0b0b0b",
+        "secondary": "#52514e",
+        "muted": "#898781",
+        "grid": "#e1e0d9",
+        "accent": "#2a78d6",
+        "other": "#d8d6ce",
+        "on_accent": "#ffffff",
+        "on_other": "#0b0b0b",
+    },
+    "dark": {
+        "surface": "#0d1117",
+        "ink": "#f0efec",
+        "secondary": "#c3c2b7",
+        "muted": "#898781",
+        "grid": "#2c2c2a",
+        "accent": "#3987e5",
+        "other": "#3d3d3a",
+        "on_accent": "#ffffff",
+        "on_other": "#f0efec",
+    },
+}
+
+
+def bar_chart(
+    bars: Sequence[tuple[str, float]], ceiling: tuple[str, float] | None, title: str, unit: str
+) -> dict[str, bytes]:
+    """Horizontal bars, kvkernels first in the accent color; one SVG per theme.
+
+    The SVG is the same bytes for the same input: fixed ids, no date, text drawn as
+    paths, so the check mode can compare files.
+    """
+    import matplotlib
+
+    matplotlib.use("svg")
+    import matplotlib.pyplot as plt
+
+    out = {}
+    for theme, c in THEMES.items():
+        with plt.rc_context({"svg.hashsalt": "kvkernels", "svg.fonttype": "path", "font.size": 10}):
+            fig, ax = plt.subplots(figsize=(7.2, 0.42 * len(bars) + 1.1))
+            fig.patch.set_facecolor(c["surface"])
+            ax.set_facecolor(c["surface"])
+            names = [name for name, _ in bars][::-1]
+            values = [value for _, value in bars][::-1]
+            colors = [c["accent"] if n == "kvkernels" else c["other"] for n in names]
+            ax.barh(names, values, height=0.6, color=colors, zorder=2)
+            top = max([*values, ceiling[1] if ceiling else 0.0]) * 1.04
+            # Values sit inside the bar ends, clear of the ceiling line.
+            for y, (name, value) in enumerate(zip(names, values, strict=True)):
+                ours = name == "kvkernels"
+                ax.text(
+                    value - top * 0.012,
+                    y,
+                    f"{value:.0f} {unit}",
+                    ha="right",
+                    va="center",
+                    color=c["on_accent"] if ours else c["on_other"],
+                    fontweight="bold" if ours else "normal",
+                    zorder=4,
+                )
+            if ceiling:
+                label, value = ceiling
+                ax.axvline(value, color=c["muted"], linestyle=(0, (4, 3)), linewidth=1, zorder=3)
+                ax.text(
+                    value,
+                    len(bars) - 0.4,
+                    f"{label}: {value:.0f} {unit}",
+                    ha="right",
+                    va="bottom",
+                    color=c["secondary"],
+                )
+            ax.set_xlim(0, top)
+            ax.set_ylim(-0.6, len(bars) + 0.2)
+            ax.set_xlabel(unit, color=c["muted"], loc="right")
+            ax.set_title(title, loc="left", color=c["ink"], fontsize=11, pad=14)
+            ax.tick_params(colors=c["muted"], length=0)
+            for tick in ax.get_yticklabels():
+                tick.set_color(c["ink"])
+            ax.grid(axis="x", color=c["grid"], linewidth=0.8, zorder=0)
+            for spine in ax.spines.values():
+                spine.set_visible(False)
+            fig.tight_layout()
+            buffer = io.BytesIO()
+            fig.savefig(buffer, format="svg", metadata={"Date": None, "Creator": None})
+            plt.close(fig)
+        out[theme] = buffer.getvalue()
+    return out
+
+
+Files = dict[str, bytes]  # path relative to the repository root -> file contents
+
+
+@dataclass(frozen=True)
+class Section:
+    readme: list[str]  # for README.md; empty when the suite has nothing to show there
+    table: list[str]  # for results/README.md
+    figures: Files
+
+
+def kv_gather_section(result: Result) -> Section | None:
+    table_lines = kv_gather_table(result)
+    if table_lines is None:
+        return None
+    fixed = {**KV_GATHER_ROW, "layout": "vllm_LBNHC"}
+    found = {impl: find(result, impl, fixed) for impl in KV_GATHER_IMPLS}
+    ours = found["kvkernels"]
+    if ours is None:
+        return Section([], table_lines, {})
+    gpu, gpu_name = result["env"]["gpu_slug"], result["env"]["gpu_name"]
+    bars = sorted(
+        (
+            (KV_GATHER_IMPLS[impl], m["gbps"])
+            for impl, m in found.items()
+            if m is not None and impl != "copy_ceiling"
+        ),
+        key=lambda bar: bar[0] != "kvkernels",
+    )
+    bars = [bars[0], *sorted(bars[1:], key=lambda bar: -bar[1])]
+    copy = found["copy_ceiling"]
+    ceiling = ("plain copy, no indexing", copy["gbps"]) if copy else None
+    title = f"Gather of 512 KV blocks (64 KiB each, random order) on a {gpu_name}"
+    charts = bar_chart(bars, ceiling, title, "GB/s")
+    paths = {theme: f"figures/{gpu}/kv_gather-{theme}.svg" for theme in charts}
+
+    summary = (
+        f"On a {gpu_name}, kvkernels gathers 512 KV blocks from vLLM's default layout at"
+        f" {ours['gbps']:.0f} GB/s"
+    )
+    if ours["pct_measured_bw"] is not None:
+        summary += f", {ours['pct_measured_bw']:.0%} of the GPU's measured copy bandwidth"
+    baselines = [f"{name} {value:.0f} GB/s" for name, value in bars[1:] if name in BASELINE_SUMMARY]
+    if baselines:
+        summary += " (" + ", ".join(baselines) + ")"
+    lines = [summary + ".", "", picture(paths["light"], paths["dark"], title)]
+    return Section(lines, table_lines, {paths[theme]: svg for theme, svg in charts.items()})
+
+
+# Baselines named in the one-line summary; the chart shows them all.
+BASELINE_SUMMARY = {"index_select", "vLLM copy kernel", "cuMemcpyBatchAsync"}
+
+
+def cascade_section(result: Result) -> Section | None:
+    table_lines = cascade_table(result)
+    return None if table_lines is None else Section(table_lines, table_lines, {})
 
 
 def kv_gather_table(result: Result) -> list[str] | None:
@@ -169,31 +331,45 @@ def cascade_table(result: Result) -> list[str] | None:
     ]
 
 
-TABLES: dict[str, Callable[[Result], list[str] | None]] = {
-    "kv_gather": kv_gather_table,
-    "cascade": cascade_table,
+SECTIONS: dict[str, tuple[str, Callable[[Result], Section | None]]] = {
+    "kv_gather": ("KV block gather", kv_gather_section),
+    "cascade": ("Cascade decode attention", cascade_section),
 }
+TABLES_PATH = "results/README.md"
+TABLES_HEADER = """# Results
+
+Generated by `make readme` from the newest result file of each suite and GPU in
+this directory. Each table comes from one file, named under it.
+"""
 
 
-def section(suite: str, results: Path, root: Path) -> str:
-    parts = []
-    for path in newest_results(results, suite):
-        result = json.loads(path.read_text())
-        lines = TABLES[suite](result)
-        if lines:
-            parts.append("\n".join([source_line(path, result, root), "", *lines]))
-    return "\n\n".join(parts) if parts else "No results yet."
-
-
-def render(readme: str, results: Path, root: Path) -> str:
-    for suite in TABLES:
+def render(readme: str, results: Path, root: Path) -> tuple[str, Files]:
+    """The README with every results section rewritten, and the other files it needs."""
+    files: Files = {}
+    tables = [TABLES_HEADER]
+    for suite, (heading, make) in SECTIONS.items():
         begin, end = f"<!-- results:{suite}:begin -->", f"<!-- results:{suite}:end -->"
         found = re.search(re.escape(begin) + r".*?" + re.escape(end), readme, re.DOTALL)
         if found is None:
             raise ValueError(f"README has no {begin} … {end} markers")
-        body = f"{begin}\n{section(suite, results, root)}\n{end}"
-        readme = readme[: found.start()] + body + readme[found.end() :]
-    return readme
+        parts = []
+        tables.append(f"## {heading}\n")
+        for path in newest_results(results, suite):
+            result = json.loads(path.read_text())
+            made = make(result)
+            if made is None:
+                continue
+            source = source_line(path, result, root)
+            if made.readme:
+                parts.append("\n".join([*made.readme, "", source]))
+            tables.append("\n".join([*made.table, "", source, ""]))
+            files.update(made.figures)
+        if len(tables[-1]) and tables[-1].startswith("## "):
+            tables.append("No results yet.\n")
+        text = "\n\n".join(parts) if parts else "No results yet."
+        readme = readme[: found.start()] + f"{begin}\n{text}\n{end}" + readme[found.end() :]
+    files[TABLES_PATH] = "\n".join(tables).encode()
+    return readme, files
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -202,13 +378,21 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
     path = ROOT / "README.md"
     current = path.read_text()
-    wanted = render(current, ROOT / "results", ROOT)
+    wanted, files = render(current, ROOT / "results", ROOT)
     if args.check:
-        if wanted != current:
-            print("README.md results tables are out of date; run `make readme`", file=sys.stderr)
+        stale = [
+            name
+            for name, data in files.items()
+            if not (ROOT / name).exists() or (ROOT / name).read_bytes() != data
+        ]
+        if wanted != current or stale:
+            print("README.md results are out of date; run `make readme`", file=sys.stderr)
             return 1
         return 0
     path.write_text(wanted)
+    for name, data in files.items():
+        (ROOT / name).parent.mkdir(parents=True, exist_ok=True)
+        (ROOT / name).write_bytes(data)
     return 0
 
 

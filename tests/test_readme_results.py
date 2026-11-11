@@ -55,7 +55,7 @@ def write(root: Path, gpu: str, suite: str, stamp: str, measurements: list[Any])
 
 
 def render(root: Path) -> str:
-    return readme_results.render(README, root / "results", root)
+    return readme_results.render(README, root / "results", root)[0]
 
 
 def test_each_gpu_gets_a_table_from_its_newest_file(tmp_path: Path) -> None:
@@ -64,19 +64,44 @@ def test_each_gpu_gets_a_table_from_its_newest_file(tmp_path: Path) -> None:
     write(
         tmp_path, "h100", "kv_gather", "20261101T000000Z", [gather("sglang_nhd", "kvkernels", 50)]
     )
-    text = render(tmp_path)
+    text, files = readme_results.render(README, tmp_path / "results", tmp_path)
     assert "old text" not in text and "kept" in text
-    assert "| vLLM default | 180 (90%) |" in text
-    assert "| 100 " not in text  # the older L4 file is not used
-    assert text.index("H100,") < text.index("L4,")
-    assert "results/l4/kv_gather/20261102T000000Z.json" in text
+    tables = files["results/README.md"].decode()
+    assert "| vLLM default | 180 (90%) |" in tables
+    assert "| 100 " not in tables  # the older L4 file is not used
+    assert tables.index("H100,") < tables.index("L4,")
+    assert "results/l4/kv_gather/20261102T000000Z.json" in tables
     assert "No results yet." in text  # cascade
 
 
 def test_rendering_twice_changes_nothing(tmp_path: Path) -> None:
     write(tmp_path, "l4", "kv_gather", "20261101T000000Z", [gather("vllm_LBNHC", "kvkernels", 100)])
-    once = render(tmp_path)
-    assert readme_results.render(once, tmp_path / "results", tmp_path) == once
+    once, figures = readme_results.render(README, tmp_path / "results", tmp_path)
+    again, figures_again = readme_results.render(once, tmp_path / "results", tmp_path)
+    assert again == once
+    assert figures_again == figures  # the same SVG bytes, so the check mode can compare
+
+
+def test_the_gather_section_has_a_summary_a_chart_per_theme_and_the_numbers(
+    tmp_path: Path,
+) -> None:
+    measurements = [
+        gather("vllm_LBNHC", "kvkernels", 180),
+        gather("vllm_LBNHC", "vllm_swap_blocks", 170),
+        gather("vllm_LBNHC", "copy_ceiling", 190),
+    ]
+    write(tmp_path, "l4", "kv_gather", "20261101T000000Z", measurements)
+    text, figures = readme_results.render(README, tmp_path / "results", tmp_path)
+    assert "kvkernels gathers 512 KV blocks from vLLM's default layout at 180 GB/s" in text
+    assert "vLLM copy kernel 170 GB/s" in text
+    charts = ["figures/l4/kv_gather-dark.svg", "figures/l4/kv_gather-light.svg"]
+    assert sorted(figures) == [*charts, "results/README.md"]
+    assert all(figures[chart].startswith(b"<?xml") for chart in charts)
+    assert 'srcset="figures/l4/kv_gather-dark.svg"' in text
+    assert "| vLLM default |" not in text  # the full table lives in results/README.md
+    tables = figures["results/README.md"].decode()
+    assert "| vLLM default | 180 (90%) |" in tables
+    assert "results/l4/kv_gather/20261101T000000Z.json" in tables
 
 
 def test_cascade_rows_and_speedup(tmp_path: Path) -> None:
