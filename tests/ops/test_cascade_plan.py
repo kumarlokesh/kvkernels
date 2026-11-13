@@ -441,6 +441,19 @@ def test_device_planning_rejects_bad_inputs() -> None:
         new_plan(setup, batch, max_parts=3)
 
 
+def test_a_cuda_device_without_an_index_is_the_current_one(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from kvkernels.ops.cascade import same_device
+
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    cuda, cuda0, cuda1 = torch.device("cuda"), torch.device("cuda:0"), torch.device("cuda:1")
+    assert same_device(cuda, cuda0) and same_device(cuda0, cuda)
+    assert not same_device(cuda, cuda1) and not same_device(cuda0, cuda1)
+    assert same_device(torch.device("cpu"), torch.device("cpu"))
+    assert not same_device(torch.device("cpu"), cuda0)
+
+
 # --- GPU tier ---------------------------------------------------------------------
 
 

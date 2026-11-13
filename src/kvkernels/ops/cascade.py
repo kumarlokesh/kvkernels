@@ -66,6 +66,18 @@ def _interpreting() -> bool:
     return os.environ.get("TRITON_INTERPRET") == "1"
 
 
+def same_device(a: torch.device, b: torch.device) -> bool:
+    """Whether two devices are the same; a CUDA device without an index is the current one."""
+    if a.type != b.type:
+        return False
+    if a.type != "cuda" or a.index == b.index:
+        return True
+    current = torch.cuda.current_device()
+    return (a.index if a.index is not None else current) == (
+        b.index if b.index is not None else current
+    )
+
+
 class CascadePlan:
     """Work items, split-K ranges and merge lists for one decode step, in fixed device buffers."""
 
@@ -374,7 +386,7 @@ class CascadePlan:
         if self.max_requests > MAX_PLAN_REQUESTS:
             raise ValueError(f"planning on the GPU supports up to {MAX_PLAN_REQUESTS} requests")
         for t in (index, seq_lens) + ((starts,) if starts is not None else ()):
-            if t.device != self.device:
+            if not same_device(t.device, self.device):
                 raise ValueError(f"index tensors must be on {self.device}, got {t.device}")
         plan_on_device(self, index=index, starts=starts, seq_lens=seq_lens, stride_r=stride_r)
         self.num_requests = num_req
