@@ -131,8 +131,14 @@ def test_bundle_holds_the_code_and_no_documents() -> None:
     assert "kvkernels/pyproject.toml" in names and "kvkernels/uv.lock" in names
     assert "kvkernels/src/kvkernels/ops/cascade.py" in names
     assert "kvkernels/scripts/gpu_session.py" in names
-    for banned in ("rfcs/", "deep-dives/", "blog/", "notes/", "AGENTS.md", "roadmap", "results/"):
-        assert not any(banned in n for n in names), banned
+    assert "kvkernels/integrations/vllm/src/kvkernels_vllm/backend.py" in names
+    assert "kvkernels/integrations/vllm/pyproject.toml" in names
+    allowed_dirs = set(kaggle_session.BUNDLE_DIRS)
+    allowed_files = set(kaggle_session.BUNDLE_FILES)
+    for name in names:
+        parts = name.split("/")[1:]
+        assert parts[0] in allowed_dirs or "/".join(parts) in allowed_files, name
+    assert not any(n.endswith(".md") and n != "kvkernels/README.md" for n in names)
     assert not any("__pycache__" in n or n.endswith(".pyc") for n in names)
 
 

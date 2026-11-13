@@ -52,8 +52,9 @@ ROOT = Path(__file__).resolve().parent.parent
 WORK = ROOT / "gpu-sessions" / "kaggle"
 KERNEL_SLUG = "kvkernels-gpu-session"
 BUNDLE_FILES = ("pyproject.toml", "uv.lock", "Makefile", "README.md", "LICENSE")
-BUNDLE_DIRS = ("src", "tests", "bench", "experiments", "scripts")
+BUNDLE_DIRS = ("src", "tests", "bench", "experiments", "scripts", "integrations")
 SKIPPED_PARTS = {"__pycache__", ".mypy_cache", ".pytest_cache", ".ruff_cache"}
+SKIPPED_SUFFIXES = {".pyc", ".md"}  # code only: no documents leave the machine
 # Kaggle's only GPU (two Tesla T4s); the CLI accepts other names and runs them on a CPU.
 ACCELERATORS = ("NvidiaTeslaT4",)
 MAX_SECONDS = 12 * 3600  # Kaggle's longest session
@@ -66,7 +67,11 @@ def bundle_paths(root: Path = ROOT) -> Iterator[Path]:
     for top in BUNDLE_DIRS:
         for path in sorted((root / top).rglob("*")):
             rel = path.relative_to(root)
-            if path.is_file() and not SKIPPED_PARTS & set(rel.parts) and path.suffix != ".pyc":
+            if (
+                path.is_file()
+                and not SKIPPED_PARTS & set(rel.parts)
+                and path.suffix not in SKIPPED_SUFFIXES
+            ):
                 yield rel
 
 

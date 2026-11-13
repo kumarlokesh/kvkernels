@@ -1,4 +1,4 @@
-"""One GPU session: the GPU-bound steps of the roadmap, in order, each with a log.
+"""One GPU session: every step that needs a GPU, in order, each with a log.
 
 On the GPU machine, from the repository root, after ``make install-cu126`` (or cu130):
 
@@ -18,8 +18,8 @@ Steps, in the order they run:
     smoke          the smoke suite (make bench-smoke)
     timer          the timer check (make check-timer); needs Nsight Compute counters
     kv_gather      the kv_gather suite
-    matmul         the K2 matmul suite; needs test-gpu-experiments
-    attention      the K2 fused attention suite; needs test-gpu-experiments
+    matmul         the experiments' matmul suite; needs test-gpu-experiments
+    attention      the experiments' fused attention suite; needs test-gpu-experiments
     cascade        the cascade suite
     dram           the device-memory bytes run (make dram-cascade); needs the counters
     plan-cost      the cost of planning one cascade step (python -m bench.plan_cost)

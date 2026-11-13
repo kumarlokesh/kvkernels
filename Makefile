@@ -1,4 +1,5 @@
-.PHONY: install install-cu126 install-cu130 install-oldest test test-gpu test-oldest lint fmt \
+.PHONY: install install-cu126 install-cu130 install-oldest install-vllm-cpu test test-gpu \
+	test-oldest test-vllm-cpu lint fmt \
 	readme bench-smoke check-timer dram-cascade plot
 
 # torch is a package dependency, so a plain `uv run` would replace the torch build
@@ -26,8 +27,23 @@ install-oldest:
 	uv pip install -q -p $(OLDEST_ENV) triton==3.7.1 numpy matplotlib pandas pytest
 	uv pip install -q -p $(OLDEST_ENV) --no-deps -e .
 
+# vLLM 0.33.0 with CPU torch, in a separate environment, to run the vLLM backend's
+# tests against vLLM's own classes without a GPU. vLLM's dependencies pull CUDA builds
+# of torchvision and torchaudio, which are swapped for the CPU builds afterwards.
+VLLM_ENV ?= .venv-vllm
+CPU_TORCH := --index-url https://download.pytorch.org/whl/cpu torch==2.14.0 torchvision torchaudio==2.11.0
+install-vllm-cpu:
+	uv venv -q --allow-existing -p 3.12 $(VLLM_ENV)
+	uv pip install -q -p $(VLLM_ENV) $(CPU_TORCH)
+	uv pip install -q -p $(VLLM_ENV) vllm==0.33.0 pytest
+	uv pip install -q -p $(VLLM_ENV) $(CPU_TORCH) --reinstall-package torchvision --reinstall-package torchaudio
+	uv pip install -q -p $(VLLM_ENV) --no-deps -e . -e integrations/vllm
+
 test:
 	TRITON_INTERPRET=1 uv run pytest -m "not gpu"
+
+test-vllm-cpu:
+	TRITON_INTERPRET=1 $(VLLM_ENV)/bin/python -m pytest -p no:cacheprovider integrations/vllm/tests -m "not gpu"
 
 test-oldest:
 	TRITON_INTERPRET=1 $(OLDEST_ENV)/bin/python -m pytest -m "not gpu"
