@@ -165,7 +165,8 @@ def _merge_two_kernel(  # type: ignore[no-untyped-def]
 def _merge_ragged_kernel(  # type: ignore[no-untyped-def]
     part_o_ptr,
     part_lse_ptr,
-    indptr_ptr,
+    start_ptr,
+    end_ptr,
     indices_ptr,
     num_rows_ptr,
     out_ptr,
@@ -180,7 +181,7 @@ def _merge_ragged_kernel(  # type: ignore[no-untyped-def]
     WRITE_LSE: tl.constexpr,
     BLOCK_D: tl.constexpr,
 ):
-    """Row r = token · heads + head merges parts indices[indptr[r] : indptr[r + 1]].
+    """Row r = token · heads + head merges parts indices[start[r] : end[r]].
 
     Parts are rows of part_o ([parts, head_dim], fp32) and part_lse ([parts]).
     The grid may be larger than the batch; rows at or past num_rows exit.
@@ -195,8 +196,8 @@ def _merge_ragged_kernel(  # type: ignore[no-untyped-def]
     m = tl.full((BLOCK_D,), float("-inf"), dtype=tl.float32)
     s = tl.zeros((BLOCK_D,), dtype=tl.float32)
     acc = tl.zeros((BLOCK_D,), dtype=tl.float32)
-    first = tl.load(indptr_ptr + row)
-    last = tl.load(indptr_ptr + row + 1)
+    first = tl.load(start_ptr + row)
+    last = tl.load(end_ptr + row)
     for i in range(first, last):
         part = tl.load(indices_ptr + i).to(tl.int64)
         part_lse = tl.load(part_lse_ptr + part)
@@ -369,7 +370,8 @@ def merge_attention_states_n(
 def merge_ragged(
     part_o: torch.Tensor,
     part_lse: torch.Tensor,
-    indptr: torch.Tensor,
+    start: torch.Tensor,
+    end: torch.Tensor,
     indices: torch.Tensor,
     num_rows: torch.Tensor,
     out: torch.Tensor,
@@ -377,7 +379,7 @@ def merge_ragged(
     *,
     max_rows: int,
 ) -> None:
-    """Row r of out ([tokens, heads, head_dim]) merges parts indices[indptr[r] : indptr[r + 1]].
+    """Row r of out ([tokens, heads, head_dim]) merges parts indices[start[r] : end[r]].
 
     part_o: [parts, head_dim] fp32; part_lse: [parts] fp32. num_rows: a one-element
     device tensor holding tokens · heads; the grid is max_rows programs, so a CUDA
@@ -388,7 +390,8 @@ def merge_ragged(
     _merge_ragged_kernel[(max_rows,)](
         part_o,
         part_lse,
-        indptr,
+        start,
+        end,
         indices,
         num_rows,
         out,

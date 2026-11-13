@@ -36,9 +36,11 @@ PUBLIC = {
         "planes",
     ],
     "kvkernels.reference": [
+        "FoundGroup",
         "RequestKV",
         "attention_ref32",
         "attention_ref_low",
+        "find_prefix_groups_ref",
         "gather_kv_blocks_ref",
         "gather_tokens",
         "merge_states_ref",

@@ -1,4 +1,4 @@
-"""Decode attention for four requests that share a 40-token prefix.
+"""Decode attention for four requests that share a 64-token prefix.
 
 Run on a GPU: python examples/cascade.py
 Without a GPU, under the Triton interpreter: TRITON_INTERPRET=1 python examples/cascade.py
@@ -7,7 +7,7 @@ Without a GPU, under the Triton interpreter: TRITON_INTERPRET=1 python examples/
 import torch
 
 from kvkernels.layouts import LAYOUTS, CacheSpec, kv_views, make_cache
-from kvkernels.ops import CascadePlan, PrefixGroup, cascade_decode_attention
+from kvkernels.ops import CascadePlan, cascade_decode_attention
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -20,7 +20,7 @@ cache = make_cache(layout, spec, device=DEVICE)
 # Once, for the largest batch the engine runs.
 plan = CascadePlan(
     max_requests=4,
-    max_groups=1,
+    max_groups=2,
     max_blocks=16,
     num_q_heads=32,
     num_kv_heads=8,
@@ -30,13 +30,15 @@ plan = CascadePlan(
     device=torch.device(DEVICE),
 )
 
-# Every decode step, on the host: requests 0-3 share a 40-token prefix in blocks
-# 1-3, and each has its own suffix.
-plan.update(
-    groups=[PrefixGroup(requests=range(0, 4), blocks=[1, 2, 3], length=40)],
-    suffix_blocks=[[4], [5], [6, 7], [8]],
-    suffix_lens=[3, 9, 20, 0],
+# Every decode step, from the engine's block table: requests 0-3 start with the
+# same four KV blocks (64 tokens of a shared prompt), then KV blocks of their own.
+block_table = torch.tensor(
+    [[1, 2, 3, 4, 5, 0], [1, 2, 3, 4, 6, 0], [1, 2, 3, 4, 7, 8], [1, 2, 3, 4, 0, 0]],
+    dtype=torch.int32,
+    device=DEVICE,
 )
+seq_lens = torch.tensor([67, 73, 84, 64], dtype=torch.int32, device=DEVICE)
+plan.plan_from_block_table(block_table, seq_lens)  # on the GPU, no host sync
 
 # Every layer: one query token per request.
 q = torch.randn(4, 32, 128, dtype=torch.float16, device=DEVICE)

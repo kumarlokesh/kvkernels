@@ -10,12 +10,20 @@ partial results:
     rows of r0    · r0's suffix blocks        ──▶ p3
     …
 
-A plan, computed on the host once per decode step and used by every layer,
-lists the tasks (one tile of an item's rows over one token range), assigns each
-partial result its slot in the workspace, and lists each (request, query head)
-row's partials for the merge. Its buffers are allocated once for a maximum
-batch and rewritten in place by each update, so the launches can be captured in
-a CUDA graph and replayed after later updates.
+A plan, computed once per decode step and used by every layer, lists the tasks
+(one tile of an item's rows over one token range), assigns each partial result
+its slot in the workspace, and lists each (request, query head) row's partials
+for the merge. Its buffers are allocated once for a maximum
+batch and rewritten in place each step, so the launches can be captured in a
+CUDA graph and replayed after later steps. Two ways to fill them:
+
+    plan_from_block_table, plan_from_slots   on the GPU, from the index the engine
+                                             already passes to attention; groups are
+                                             found from shared leading KV blocks
+    update                                   on the host, from groups the caller names
+
+Requests are read through a permutation, so a group's requests need not be
+consecutive in the batch; out[r] is always request r.
 
 Three launches: prefix tasks, suffix tasks, merge. The two attention launches
 run the same kernel with different row-tile heights: a prefix item has many
@@ -36,6 +44,7 @@ from dataclasses import dataclass
 import torch
 
 from kvkernels.ops._registry import registered_op
+from kvkernels.ops.cascade_plan import MAX_PLAN_REQUESTS, plan_on_device
 from kvkernels.ops.merge_states import merge_ragged
 from kvkernels.ops.prefix_attention import attend
 
@@ -80,6 +89,8 @@ class CascadePlan:
         prefix_block_m: int = 64,
         suffix_block_m: int = 16,
         block_n: int | None = None,
+        min_shared_tokens: int = 64,
+        batch_invariant: bool = False,
     ) -> None:
         if num_q_heads % num_kv_heads:
             raise ValueError(f"num_q_heads {num_q_heads} is not a multiple of {num_kv_heads}")
@@ -88,6 +99,8 @@ class CascadePlan:
             raise ValueError(f"GQA group {self.group} must be 1 to {suffix_block_m}")
         if head_dim not in HEAD_DIMS:
             raise ValueError(f"head_dim must be one of {HEAD_DIMS}, got {head_dim}")
+        if prefix_block_m == suffix_block_m:
+            raise ValueError("prefix and suffix row tiles must differ in height")
         self.max_requests = max_requests
         self.max_groups = max_groups
         self.max_blocks = max_blocks
@@ -97,8 +110,26 @@ class CascadePlan:
         self.block_size = block_size
         self.num_blocks = num_blocks
         self.device = device
+        self.max_splits = MAX_SPLITS
+        self.min_shared_tokens = min_shared_tokens
+        self.min_shared_blocks = max(1, math.ceil(min_shared_tokens / block_size))
+        self.batch_invariant = batch_invariant
         self.max_tasks = max_tasks or (64 * max_groups + MAX_SPLITS * max_requests)
         self.max_parts = max_parts or (2 * max_requests * num_q_heads * MAX_SPLITS)
+        # Without split-K every plan fits: one prefix and one suffix part per row.
+        # A batch-invariant plan must fit with split-K, which it never turns off.
+        splits = MAX_SPLITS if batch_invariant else 1
+        need_parts = (1 if batch_invariant else 2) * max_requests * num_q_heads * splits
+        need_tasks = max(
+            max_requests * splits,
+            0
+            if batch_invariant
+            else max_groups + math.ceil(max_requests * self.group / prefix_block_m),
+        )
+        if self.max_parts < need_parts:
+            raise ValueError(f"max_parts {self.max_parts} is below {need_parts}")
+        if self.max_tasks < need_tasks:
+            raise ValueError(f"max_tasks {self.max_tasks} is below {need_tasks}")
         if num_sms is None:
             num_sms = (
                 torch.cuda.get_device_properties(device).multi_processor_count
@@ -118,19 +149,28 @@ class CascadePlan:
 
         items = max_groups + max_requests
         self.blocks = ints(max_blocks)
+        self.perm = ints(max_requests)  # row i of the sorted batch is request perm[i]
+        self.common = ints(max_requests)  # device planning: KV blocks shared with the previous row
         self.item_req_start, self.item_num_reqs, self.item_block_start = (
             ints(items),
             ints(items),
             ints(items),
         )
-        self.prefix_tasks = tuple(ints(self.max_tasks) for _ in range(5))
-        self.suffix_tasks = tuple(ints(self.max_tasks) for _ in range(5))
-        self.counts = ints(3)  # prefix tasks, suffix tasks, merge rows
-        self.merge_indptr = ints(self.max_rows + 1)
+        # Device planning: length, ranges, span, task start, part start, merge offset per item.
+        self.item_info = torch.zeros((6, items), dtype=torch.int32, device=device)
+        # Item, row start, token start, token end, part base; prefix tasks, then suffix tasks.
+        self.tasks = torch.zeros((2, 5, self.max_tasks), dtype=torch.int32, device=device)
+        self.prefix_tasks = tuple(self.tasks[0])
+        self.suffix_tasks = tuple(self.tasks[1])
+        self.counts = ints(5)  # prefix tasks, suffix tasks, merge rows, groups, items
+        self.merge_start = ints(self.max_rows)
+        self.merge_end = ints(self.max_rows)
         self.merge_indices = ints(self.max_parts)
         self.part_o = torch.zeros((self.max_parts, head_dim), dtype=torch.float32, device=device)
         self.part_lse = torch.zeros(self.max_parts, dtype=torch.float32, device=device)
         self.num_requests = 0
+        self.index = self.blocks  # what item_block_start points into
+        self.per_token = False  # index holds one slot per token (a slot list)
 
     # ----------------------------------------------------------------------------------
 
@@ -168,10 +208,12 @@ class CascadePlan:
                     raise ValueError(f"{name}: block {b} is outside 0 … {self.num_blocks - 1}")
 
     def _splits(self, length: int, base_programs: int) -> int:
+        by_length = math.ceil(length / self.min_split_tokens)
+        if self.batch_invariant:
+            return max(1, min(MAX_SPLITS, by_length))
         target = self.programs_per_sm * self.num_sms
         if base_programs >= target:
             return 1
-        by_length = math.ceil(length / self.min_split_tokens)
         return max(1, min(MAX_SPLITS, by_length, math.ceil(target / max(base_programs, 1))))
 
     def update(
@@ -181,7 +223,9 @@ class CascadePlan:
         suffix_blocks: Sequence[Sequence[int]],
         suffix_lens: Sequence[int],
     ) -> None:
-        """Plan one decode step. Requests are numbered 0 … len(suffix_lens) - 1."""
+        """Plan one decode step on the host. Requests are numbered 0 … len(suffix_lens) - 1."""
+        if self.batch_invariant and groups:
+            raise ValueError("a batch-invariant plan makes no groups")
         self._check(groups, suffix_blocks, suffix_lens)
         num_req = len(suffix_lens)
         g, hkv, hq = self.group, self.num_kv_heads, self.num_q_heads
@@ -210,8 +254,6 @@ class CascadePlan:
             self.prefix_block_m: [[], [], [], [], []],
             self.suffix_block_m: [[], [], [], [], []],
         }
-        if self.prefix_block_m == self.suffix_block_m:
-            raise ValueError("prefix and suffix row tiles must differ in height")
         parts_of_row: list[list[int]] = [[] for _ in range(num_req * hq)]
         next_part = 0
         for index, (first_req, n_req, blocks, length, bm) in enumerate(items):
@@ -249,17 +291,18 @@ class CascadePlan:
                 f"the batch needs {next_part} partial results, above max_parts {self.max_parts}"
             )
 
-        indptr = [0]
+        starts: list[int] = []
         indices: list[int] = []
         for parts in parts_of_row:
+            starts.append(len(indices))
             indices.extend(parts)
-            indptr.append(len(indices))
 
         def put(buffer: torch.Tensor, values: Sequence[int]) -> None:
             if values:
                 buffer[: len(values)].copy_(torch.tensor(values, dtype=torch.int32))
 
         put(self.blocks, flat)
+        put(self.perm, range(num_req))
         put(self.item_req_start, req_start)
         put(self.item_num_reqs, num_reqs)
         put(self.item_block_start, block_start)
@@ -269,24 +312,89 @@ class CascadePlan:
         ):
             for buffer, column in zip(buffers, columns, strict=True):
                 put(buffer, column)
-        put(self.merge_indptr, indptr)
+        put(self.merge_start, starts)
+        put(self.merge_end, [*starts[1:], len(indices)])
         put(self.merge_indices, indices)
         put(self.counts, [len(prefix_tasks[0]), len(suffix_tasks[0]), num_req * hq])
         self.num_requests = num_req
+        self.index, self.per_token = self.blocks, False
+
+    def plan_from_block_table(self, block_table: torch.Tensor, seq_lens: torch.Tensor) -> None:
+        """Plan one decode step on the GPU from a vLLM-style index, without a host sync.
+
+        block_table: [requests, width] int32, row r holding request r's KV block ids
+        (entries past its length are never read). seq_lens: [requests] int32; a
+        request of length 0 is a padded row and gets out = 0. Requests whose rows
+        start with the same KV blocks form a group when they share at least
+        min_shared_tokens; the group covers the whole KV blocks every member
+        shares. The attention reads block_table in place until the next plan, so
+        keep it unchanged until then.
+        """
+        if block_table.dim() != 2 or block_table.dtype != torch.int32:
+            raise ValueError(f"block_table must be 2-D int32, got {block_table.dtype}")
+        if block_table.shape[1] > 0 and block_table.stride(1) != 1:
+            raise ValueError("block_table rows must be contiguous")
+        self._plan_on_device(block_table, None, seq_lens, block_table.stride(0))
+
+    def plan_from_slots(
+        self, slot_indptr: torch.Tensor, slots: torch.Tensor, seq_lens: torch.Tensor
+    ) -> None:
+        """Plan one decode step on the GPU from an SGLang-style index, without a host sync.
+
+        slots: one slot per token, int32 or int64, request r's tokens at
+        slots[slot_indptr[r] : slot_indptr[r] + seq_lens[r]]; slot s is token
+        s % block_size of page s // block_size. slot_indptr: [requests + 1] or
+        [requests] int32. Groups are found as in plan_from_block_table, comparing
+        each page's first slot; the attention reads slots in place.
+        """
+        if slots.dim() != 1 or slots.dtype not in (torch.int32, torch.int64):
+            raise ValueError(f"slots must be 1-D int32 or int64, got {slots.dtype}")
+        if slot_indptr.dim() != 1 or slot_indptr.dtype != torch.int32:
+            raise ValueError(f"slot_indptr must be 1-D int32, got {slot_indptr.dtype}")
+        if slot_indptr.shape[0] not in (seq_lens.shape[0], seq_lens.shape[0] + 1):
+            raise ValueError(
+                f"slot_indptr has {slot_indptr.shape[0]} entries for {seq_lens.shape[0]} requests"
+            )
+        self._plan_on_device(slots, slot_indptr, seq_lens, 0)
+
+    def _plan_on_device(
+        self,
+        index: torch.Tensor,
+        starts: torch.Tensor | None,
+        seq_lens: torch.Tensor,
+        stride_r: int,
+    ) -> None:
+        if seq_lens.dim() != 1 or seq_lens.dtype != torch.int32:
+            raise ValueError(f"seq_lens must be 1-D int32, got {seq_lens.dtype}")
+        num_req = seq_lens.shape[0]
+        if num_req > self.max_requests:
+            raise ValueError(f"{num_req} requests exceed max_requests {self.max_requests}")
+        if starts is None and index.shape[0] != num_req:
+            raise ValueError(f"block_table has {index.shape[0]} rows for {num_req} requests")
+        if self.max_requests > MAX_PLAN_REQUESTS:
+            raise ValueError(f"planning on the GPU supports up to {MAX_PLAN_REQUESTS} requests")
+        for t in (index, seq_lens) + ((starts,) if starts is not None else ()):
+            if t.device != self.device:
+                raise ValueError(f"index tensors must be on {self.device}, got {t.device}")
+        plan_on_device(self, index=index, starts=starts, seq_lens=seq_lens, stride_r=stride_r)
+        self.num_requests = num_req
+        self.index, self.per_token = index, starts is not None
 
     # ----------------------------------------------------------------------------------
 
     def tensors(self) -> list[torch.Tensor]:
         """Read-only plan tensors, in the order the registered op expects."""
         return [
-            self.blocks,
+            self.index,
+            self.perm,
             self.item_req_start,
             self.item_num_reqs,
             self.item_block_start,
             *self.prefix_tasks,
             *self.suffix_tasks,
             self.counts,
-            self.merge_indptr,
+            self.merge_start,
+            self.merge_end,
             self.merge_indices,
         ]
 
@@ -299,6 +407,7 @@ class CascadePlan:
             self.prefix_block_m,
             self.suffix_block_m,
             self.block_n,
+            int(self.per_token),
         ]
 
 
@@ -314,14 +423,16 @@ def _cascade_op(
     sm_scale: float,
     settings: list[int],
 ) -> None:
-    blocks, req_start, num_reqs, block_start = plan_tensors[:4]
-    prefix_tasks = tuple(plan_tensors[4:9])
-    suffix_tasks = tuple(plan_tensors[9:14])
-    counts, indptr, indices = plan_tensors[14:17]
+    index, perm, req_start, num_reqs, block_start = plan_tensors[:5]
+    prefix_tasks = tuple(plan_tensors[5:10])
+    suffix_tasks = tuple(plan_tensors[10:15])
+    counts, merge_start, merge_end, indices = plan_tensors[15:19]
     part_o, part_lse = workspace
-    block_size, group, max_tasks, max_rows, prefix_bm, suffix_bm, block_n = settings
+    block_size, group, max_tasks, max_rows, prefix_bm, suffix_bm, block_n, per_token = settings
     common = {
-        "blocks": blocks,
+        "index": index,
+        "perm": perm,
+        "per_token": bool(per_token),
         "item_req_start": req_start,
         "item_num_reqs": num_reqs,
         "item_block_start": block_start,
@@ -335,7 +446,17 @@ def _cascade_op(
     }
     attend(q, k, v, tasks=prefix_tasks, num_tasks=counts[0:1], block_m=prefix_bm, **common)  # type: ignore[arg-type]
     attend(q, k, v, tasks=suffix_tasks, num_tasks=counts[1:2], block_m=suffix_bm, **common)  # type: ignore[arg-type]
-    merge_ragged(part_o, part_lse, indptr, indices, counts[2:3], out, lse_out, max_rows=max_rows)
+    merge_ragged(
+        part_o,
+        part_lse,
+        merge_start,
+        merge_end,
+        indices,
+        counts[2:3],
+        out,
+        lse_out,
+        max_rows=max_rows,
+    )
 
 
 @_cascade_op.register_fake
@@ -363,7 +484,7 @@ def cascade_decode_attention(
     *,
     sm_scale: float | None = None,
 ) -> None:
-    """Decode attention for the batch the plan was last updated with.
+    """Decode attention for the batch the plan was last filled for.
 
     q: [requests, q_heads, head_dim], fp16 or bf16. k, v: one layer's K and V
     views from kvkernels.layouts, [blocks, block_size, kv_heads, head_dim], same

@@ -98,6 +98,7 @@ STEPS = (
     ),
     Step("cascade", _suite("cascade"), writes_results=True, needs=RESULT_TESTS),
     Step("dram", "uv run python -m bench.dram_bytes", writes_results=True, needs=RESULT_TESTS),
+    Step("plan-cost", "uv run python -m bench.plan_cost"),
     Step(
         "old-torch",
         f"uv venv -q --allow-existing {OLD_TORCH_ENV}"

@@ -3,13 +3,16 @@
 A work item is a set of query rows and one block list: a prefix group (every
 request of the group, each with its GQA group of query heads, over the group's
 shared blocks) or one request's suffix (its own rows over its own blocks). A
-task is one tile of an item's rows over one token range of its block list.
+task is one tile of an item's rows over one token range of its block list. An
+item's requests are consecutive rows of the sorted batch; request = perm[row].
 
 Grid: (tasks, KV heads). One program:
 
     resident                                     per tile of BLOCK_N tokens
     q    BLOCK_M rows · head_dim, gathered:      token t ──▶ block = list[t // block_size],
          row i = (request, query head) of               slot = t % block_size
+                                                 (slot list: s = list[t], block =
+                                                 s // block_size, slot = s % block_size)
          the item, for this KV head              K, V of this KV head ◀── device memory
     m, l running max and sum per row             s = q · kᵀ · scale (base 2); online softmax
     acc  BLOCK_M · head_dim, fp32                acc = acc · 2^(m - m_new) + p · v
@@ -37,7 +40,8 @@ def _work_item_kernel(  # type: ignore[no-untyped-def]
     q_ptr,
     k_ptr,
     v_ptr,
-    blocks_ptr,
+    index_ptr,
+    perm_ptr,
     item_req_start_ptr,
     item_num_reqs_ptr,
     item_block_start_ptr,
@@ -66,6 +70,7 @@ def _work_item_kernel(  # type: ignore[no-untyped-def]
     HEAD_DIM: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    PER_TOKEN: tl.constexpr,
 ):
     task = tl.program_id(0)
     kv_head = tl.program_id(1)
@@ -77,7 +82,7 @@ def _work_item_kernel(  # type: ignore[no-untyped-def]
     tok_end = tl.load(task_tok_end_ptr + task)
     part_base = tl.load(task_part_base_ptr + task).to(tl.int64)
     req_start = tl.load(item_req_start_ptr + item)
-    block_start = tl.load(item_block_start_ptr + item)
+    block_start = tl.load(item_block_start_ptr + item).to(tl.int64)
     item_rows = tl.load(item_num_reqs_ptr + item) * GROUP
     tile_rows = tl.minimum(item_rows - row_start, BLOCK_M)
 
@@ -85,7 +90,7 @@ def _work_item_kernel(  # type: ignore[no-untyped-def]
     rows = tl.arange(0, BLOCK_M)
     row_ok = rows < tile_rows
     item_row = row_start + rows
-    request = req_start + item_row // GROUP
+    request = tl.load(perm_ptr + req_start + item_row // GROUP, mask=row_ok, other=0)
     q_head = kv_head * GROUP + item_row % GROUP
     dims = tl.arange(0, HEAD_DIM)
     q = tl.load(
@@ -104,9 +109,14 @@ def _work_item_kernel(  # type: ignore[no-untyped-def]
     for start in range(tok_start, tok_end, BLOCK_N):
         tokens = start + cols
         tok_ok = tokens < tok_end
-        block = tl.load(blocks_ptr + block_start + tokens // block_size, mask=tok_ok, other=0)
-        block = block.to(tl.int64)
-        slot = tokens % block_size
+        if PER_TOKEN:
+            entry = tl.load(index_ptr + block_start + tokens, mask=tok_ok, other=0).to(tl.int64)
+            block = entry // block_size
+            slot = entry % block_size
+        else:
+            block = tl.load(index_ptr + block_start + tokens // block_size, mask=tok_ok, other=0)
+            block = block.to(tl.int64)
+            slot = tokens % block_size
         k = tl.load(
             k_ptr
             + block[None, :] * stride_kb
@@ -147,7 +157,9 @@ def attend(
     k: torch.Tensor,
     v: torch.Tensor,
     *,
-    blocks: torch.Tensor,
+    index: torch.Tensor,
+    perm: torch.Tensor,
+    per_token: bool,
     item_req_start: torch.Tensor,
     item_num_reqs: torch.Tensor,
     item_block_start: torch.Tensor,
@@ -170,7 +182,8 @@ def attend(
         q,
         k,
         v,
-        blocks,
+        index,
+        perm,
         item_req_start,
         item_num_reqs,
         item_block_start,
@@ -191,6 +204,7 @@ def attend(
         HEAD_DIM=q.shape[2],
         BLOCK_M=block_m,
         BLOCK_N=block_n,
+        PER_TOKEN=per_token,
         num_warps=num_warps,
         num_stages=num_stages,
     )

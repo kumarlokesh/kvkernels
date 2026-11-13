@@ -52,7 +52,8 @@ def test_grid_covers_the_planned_cases() -> None:
     params = list(suite.grid())
     main = 2 * 6 * 4 * 4  # models, batches, prefixes, suffixes
     extra = 4 * 4 * 4  # per (prefix, suffix): groups, GQA 1, GQA 8, SGLang layout
-    assert len(params) == main + extra + 1  # and one bf16 shape
+    threshold = 2 * len(suite.THRESHOLD_PREFIXES)  # batch 2 and 8
+    assert len(params) == main + extra + 1 + threshold  # and one bf16 shape
     assert len({tuple(sorted(p.items())) for p in params}) == len(params)
     for p in params:
         assert int(p["batch"]) % int(p["groups"]) == 0
@@ -102,6 +103,18 @@ def test_flashinfer_entries_follow_availability_and_empty_suffixes() -> None:
     assert not any(name.startswith("flashinfer") for name in without)
 
 
+def test_threshold_settings_run_only_on_the_threshold_cases() -> None:
+    sweep = suite.implementations(
+        suite._params(batch=2, prefix=64, suffix=512), with_flashinfer=False
+    )
+    main = suite.implementations(
+        suite._params(batch=2, prefix=512, suffix=512), with_flashinfer=False
+    )
+    assert {"kvkernels_gpu_grouped", "kvkernels_gpu_ungrouped"} <= set(sweep)
+    assert "kvkernels_gpu_grouped" not in main
+    assert "kvkernels_gpu_plan" in main
+
+
 def test_split_settings_run_only_at_small_batch() -> None:
     small = suite.implementations(
         suite._params(batch=4, prefix=512, suffix=0), with_flashinfer=False
@@ -120,8 +133,9 @@ def test_split_settings_run_only_at_small_batch() -> None:
         {},
         {"batch": 4, "groups": 2, "suffix_len": 0},
         {"layout": "sglang_nhd", "block": 1, "prefix_len": 12, "suffix_len": 5},
+        {"batch": 2, "prefix_len": 16, "suffix_len": 512},
     ],
-    ids=["one_group", "two_groups_no_suffix", "sglang_one_token_pages"],
+    ids=["one_group", "two_groups_no_suffix", "sglang_one_token_pages", "threshold"],
 )
 def test_every_implementation_matches_the_reference(changes: dict[str, int | str]) -> None:
     case = suite.make_case(tiny(**changes), with_flashinfer=False, device=DEVICE)

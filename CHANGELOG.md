@@ -18,6 +18,12 @@ passed on the released source, with the torch and Triton versions of that run.
 - `cascade_decode_attention`, `CascadePlan` and `PrefixGroup`: decode attention
   that reads each shared prefix once per group of requests, with split-K for
   small batches and CUDA graph capture across plan updates.
+- `CascadePlan.plan_from_block_table` and `CascadePlan.plan_from_slots`: plan
+  the cascade on the GPU from a vLLM block table or an SGLang slot list. Requests
+  that share leading KV blocks are grouped without naming groups and without a
+  host sync, so planning and attention capture in one CUDA graph.
+- `CascadePlan(batch_invariant=True)`: no groups and split-K by each request's
+  length alone, so a request's output does not depend on its batch.
 - `kvkernels.layouts`: the KV cache layouts of vLLM 0.32.0 and SGLang 0.5.22,
   and the views the ops take of them.
 - `kvkernels.reference`: PyTorch references for every op.

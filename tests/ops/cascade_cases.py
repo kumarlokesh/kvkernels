@@ -12,6 +12,7 @@ import math
 import os
 from collections.abc import Sequence
 from dataclasses import dataclass
+from typing import Any
 
 import torch
 
@@ -94,7 +95,7 @@ def make_case(
     return Case(q, k, v, groups, suffix_blocks, list(suffix_lens), requests, block_size, num_blocks)
 
 
-def make_plan(case: Case, **kwargs: int) -> CascadePlan:
+def make_plan(case: Case, **kwargs: Any) -> CascadePlan:
     plan = CascadePlan(
         max_requests=max(len(case.suffix_lens), 1),
         max_groups=len(case.groups) + 2,  # room for tests that submit other groups

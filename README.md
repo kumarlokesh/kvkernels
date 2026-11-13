@@ -37,7 +37,7 @@ request 1    ██████████████████████�
 request 2    ████████████████████████   ░░░░░░░░░   ─┘
              └── read once for all ─┘   └ per request ┘
 
-plan.update(groups=[PrefixGroup(requests=range(0, 3), blocks=[1, 2, 3], length=40)], ...)
+plan.plan_from_block_table(block_table, seq_lens)   # each step, on the GPU: finds the prefix
 cascade_decode_attention(q, k, v, plan, out)        # each layer
 ```
 

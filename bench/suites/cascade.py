@@ -19,6 +19,8 @@ Cases (RFC grid):
     GQA       group sizes 1 and 8 at batch 32
     layout    SGLang's default (NHD, one-token pages) at batch 32
     bf16      one shape
+    threshold batch 2 and 8, prefix 16 … 256, suffix 512: the shared length at
+              which a group starts to beat reading the prefix once per request
 
 Implementations, each checked against the first within the fp32-reference
 tolerance rule (output only; the LSE is checked in the op's tests):
@@ -27,7 +29,9 @@ tolerance rule (output only; the LSE is checked in the op's tests):
                             and suffix; first, and so the reference, when FlashInfer
                             runs on this machine
     torch_per_request       PyTorch SDPA per request; first only when FlashInfer does not run
-    kvkernels               the cascade
+    kvkernels               the cascade, groups named on the host
+    kvkernels_gpu_plan      the cascade planned on the GPU from the block table (or
+                            slot list) each step; planning is inside the timed call
     kvkernels_per_request   the same op with every request its own group: per-request
                             decode with kvkernels' kernel, separating the cascade's
                             effect from the kernel's quality
@@ -37,10 +41,13 @@ tolerance rule (output only; the LSE is checked in the op's tests):
     vllm_triton_decode      vLLM's Triton attention kernel, copied, on the engine layout
     kvkernels_split…,       batch 1 and 4 only: the cascade with other split-K
     kvkernels_pps…          settings (minimum range length; programs per SM)
+    kvkernels_gpu_grouped,  threshold cases only: planned on the GPU with every
+    kvkernels_gpu_ungrouped run of shared KV blocks a group, and with none
 
 FlashInfer runs on a copy of K and V in its own layout (NHD, contiguous), with
 the same values. Planning (kvkernels' plan update, FlashInfer's plan, vLLM's
-block table and scratch) is excluded from timing and recorded as plan_us.
+block table and scratch) is excluded from timing and recorded as plan_us; for
+kvkernels_gpu_plan, plan_us is building the index an engine already has.
 
 bytes_moved and flops follow the roofline model of a cascade: each group's prefix
 read once, each suffix read once, every query head's two matrix products over
@@ -72,6 +79,8 @@ PREFIXES = (512, 2048, 8192, 32768)
 SUFFIXES = (0, 128, 512, 2048)
 BLOCK_SIZE = 16
 DEFAULT_LAYOUT = "vllm_LBNHC"
+THRESHOLD_PREFIXES = (16, 32, 64, 128, 256)
+NEVER_GROUP = 1 << 30
 # The split-K settings timed at batch 1 and 4: (minimum range length, programs per SM).
 SPLIT_SETTINGS = {
     "kvkernels_split256": (256, 2),
@@ -123,6 +132,13 @@ def grid() -> Iterator[Params]:
                 yield _params(batch=32, prefix=prefix, suffix=suffix, kv_heads=kv_heads)
             yield _params(batch=32, prefix=prefix, suffix=suffix, layout="sglang_nhd", block=1)
     yield _params(batch=32, prefix=8192, suffix=512, dtype="bfloat16")
+    for batch in (2, 8):
+        for prefix in THRESHOLD_PREFIXES:
+            yield _params(batch=batch, prefix=prefix, suffix=512)
+
+
+def is_threshold_sweep(p: Params) -> bool:
+    return int(p["prefix_len"]) in THRESHOLD_PREFIXES and int(p["batch"]) in (2, 8)
 
 
 def is_split_sweep(p: Params) -> bool:
@@ -342,7 +358,8 @@ class Kvkernels:
                 num_blocks=k.shape[0],
                 device=torch.device(q.device),
                 max_tasks=MAX_SPLITS * (len(groups) + math.ceil(rows / 64) + b.size),
-                **self.settings,
+                min_split_tokens=self.settings["min_split_tokens"],
+                programs_per_sm=self.settings["programs_per_sm"],
             )
             self.key = key
         self.cascade.update(groups=groups, suffix_blocks=b.suffix_blocks, suffix_lens=b.suffix_lens)
@@ -351,6 +368,53 @@ class Kvkernels:
         from kvkernels.ops.cascade import cascade_decode_attention
 
         assert self.cascade is not None
+        cascade_decode_attention(t["q"], t["k"], t["v"], self.cascade, t["out"])
+
+
+class KvkernelsGpuPlan:
+    """Plans every step on the GPU from the index, inside the timed call."""
+
+    def __init__(self, *, layout: str, min_shared_tokens: int = 64) -> None:
+        self.layout = layout
+        self.min_shared_tokens = min_shared_tokens
+        self.cascade: CascadePlan | None = None
+        self.index: dict[str, torch.Tensor] = {}
+
+    def plan(self, t: Tensors) -> None:
+        import torch
+
+        from kvkernels.layouts import LAYOUTS, CacheSpec, make_index
+        from kvkernels.ops.cascade import CascadePlan
+
+        b = batch_of(t)
+        q, k = t["q"], t["k"]
+        lens = b.request_lens()
+        spec = CacheSpec(1, k.shape[0], k.shape[1], k.shape[2], k.shape[3], k.dtype)
+        self.index = make_index(LAYOUTS[self.layout], spec, b.request_blocks(), lens, q.device)
+        self.index["seq_lens"] = torch.tensor(lens, dtype=torch.int32, device=q.device)
+        self.cascade = CascadePlan(
+            max_requests=b.size,
+            max_groups=max(b.size // 2, 1),
+            max_blocks=1,
+            num_q_heads=q.shape[1],
+            num_kv_heads=k.shape[2],
+            head_dim=q.shape[2],
+            block_size=k.shape[1],
+            num_blocks=k.shape[0],
+            device=torch.device(q.device),
+            min_shared_tokens=self.min_shared_tokens,
+        )
+
+    def run(self, t: Tensors) -> None:
+        from kvkernels.ops.cascade import cascade_decode_attention
+
+        assert self.cascade is not None
+        if "block_table" in self.index:
+            self.cascade.plan_from_block_table(self.index["block_table"], self.index["seq_lens"])
+        else:
+            self.cascade.plan_from_slots(
+                self.index["kv_indptr"], self.index["kv_indices"], self.index["seq_lens"]
+            )
         cascade_decode_attention(t["q"], t["k"], t["v"], self.cascade, t["out"])
 
 
@@ -523,6 +587,8 @@ def implementations(p: Params, *, with_flashinfer: bool) -> dict[str, Any]:
     else:
         impls["torch_per_request"] = torch_per_request
     impls["kvkernels"] = Kvkernels()
+    layout = str(p["layout"])
+    impls["kvkernels_gpu_plan"] = KvkernelsGpuPlan(layout=layout)
     impls["kvkernels_per_request"] = Kvkernels(per_request=True)
     if with_flashinfer:
         impls["flashinfer_decode_tc"] = FlashInferDecode(tensor_cores=True)
@@ -532,6 +598,11 @@ def implementations(p: Params, *, with_flashinfer: bool) -> dict[str, Any]:
     if is_split_sweep(p):
         for name, (min_split, per_sm) in SPLIT_SETTINGS.items():
             impls[name] = Kvkernels(min_split_tokens=min_split, programs_per_sm=per_sm)
+    if is_threshold_sweep(p):
+        impls["kvkernels_gpu_grouped"] = KvkernelsGpuPlan(layout=layout, min_shared_tokens=1)
+        impls["kvkernels_gpu_ungrouped"] = KvkernelsGpuPlan(
+            layout=layout, min_shared_tokens=NEVER_GROUP
+        )
     return impls
 
 
