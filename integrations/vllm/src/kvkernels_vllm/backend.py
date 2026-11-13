@@ -47,6 +47,21 @@ from kvkernels_vllm.decode import HEAD_SIZES, check_decode, decode, new_plan, un
 CHECK_ENV = "KVKERNELS_VLLM_CHECK"
 
 
+@dataclass
+class Calls:
+    """Python-side calls in this process: decode batches run, and those checked.
+
+    Under a full CUDA graph Python runs forward only while capturing, so a
+    replay adds nothing here.
+    """
+
+    decode: int = 0
+    checked: int = 0
+
+
+calls = Calls()
+
+
 def _checking() -> bool:
     return os.environ.get(CHECK_ENV) == "1"
 
@@ -175,6 +190,8 @@ class KvkernelsAttentionImpl(TritonAttentionImpl):
             raise NotImplementedError("the kvkernels backend does not quantize its output")
         n = attn_metadata.num_decode_tokens
         if n:
+            calls.decode += 1
+        if n:
             assert attn_metadata.plan is not None
             q = query[:n].view(n, self.num_heads, self.head_size)
             out = output[:n].view(n, self.num_heads, self.head_size)
@@ -208,6 +225,7 @@ class KvkernelsAttentionImpl(TritonAttentionImpl):
                     head_size=self.head_size,
                     scale=self.scale,
                 )
+                calls.checked += 1
         if attn_metadata.prefill is not None:
             super().forward(
                 layer, query[n:], key[n:], value[n:], kv_cache, attn_metadata.prefill, output[n:]

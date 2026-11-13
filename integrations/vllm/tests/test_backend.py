@@ -17,7 +17,7 @@ pytest.importorskip("vllm")
 
 import torch
 
-from kvkernels_vllm import BACKEND, register
+from kvkernels_vllm import BACKEND, backend, register
 from kvkernels_vllm.decode import kv_views
 
 
@@ -221,7 +221,13 @@ def test_a_mixed_batch_through_the_builder_and_forward(monkeypatch: pytest.Monke
             token += 1
 
 
+def _model_dtype() -> str:
+    # vLLM accepts bf16 from compute capability 8.0; torch reports emulated bf16 below it.
+    return "bfloat16" if torch.cuda.get_device_capability() >= (8, 0) else "float16"
+
+
 SMALL_MODEL = "Qwen/Qwen3-0.6B"  # 16 query heads, 8 KV heads, head_dim 128; not gated
+SMALL_MODEL_LAYERS = 28
 SYSTEM = "You are a careful assistant. Answer in one short sentence. " * 12
 
 
@@ -234,7 +240,7 @@ def test_every_decode_call_matches_vllm_and_fp32_in_a_server_step(
     monkeypatch.setenv("KVKERNELS_VLLM_CHECK", "1")
     monkeypatch.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
     register()
-    dtype = "bfloat16" if torch.cuda.is_bf16_supported() else "float16"
+    dtype = _model_dtype()
     llm = LLM(
         SMALL_MODEL,
         attention_backend="CUSTOM",
@@ -245,18 +251,22 @@ def test_every_decode_call_matches_vllm_and_fp32_in_a_server_step(
     )
     prompts = [f"{SYSTEM}\nQuestion {i}: name a prime number above {10 * i}." for i in range(12)]
     prompts += ["Count from one to five.", "Name a colour."]  # no shared prefix
+    before = backend.calls.checked
     outputs = llm.generate(prompts, SamplingParams(temperature=0.0, max_tokens=32))
     assert all(o.outputs[0].token_ids for o in outputs)
+    # The engine runs in this process, so this proves vLLM used the kvkernels backend.
+    assert backend.calls.checked - before >= 31, "fewer checked decode steps than tokens"
 
 
 @pytest.mark.gpu
-def test_decode_batches_run_in_full_cuda_graphs() -> None:
+def test_decode_batches_run_in_full_cuda_graphs(monkeypatch: pytest.MonkeyPatch) -> None:
     from vllm import LLM, SamplingParams
 
     if os.environ.get("KVKERNELS_VLLM_CHECK") == "1":
         pytest.skip("the check copies to the host, which a CUDA graph cannot capture")
+    monkeypatch.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
     register()
-    dtype = "bfloat16" if torch.cuda.is_bf16_supported() else "float16"
+    dtype = _model_dtype()
     llm = LLM(
         SMALL_MODEL,
         attention_backend="CUSTOM",
@@ -265,5 +275,11 @@ def test_decode_batches_run_in_full_cuda_graphs() -> None:
         gpu_memory_utilization=0.5,
     )
     prompts = [f"{SYSTEM}\nQuestion {i}: name a city." for i in range(24)]
+    captured = backend.calls.decode
+    assert captured > 0, "vLLM did not capture decode graphs with the kvkernels backend"
     outputs = llm.generate(prompts, SamplingParams(temperature=0.0, max_tokens=48))
     assert all(len(o.outputs[0].token_ids) > 0 for o in outputs)
+    # Run eagerly, 47 decode steps would call forward once per layer each. Graph replays
+    # call nothing from Python; only steps that mix prefill and decode run eagerly.
+    eager = 47 * SMALL_MODEL_LAYERS
+    assert backend.calls.decode - captured < eager // 2, "decode steps ran eagerly"
