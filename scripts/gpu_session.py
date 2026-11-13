@@ -22,9 +22,17 @@ Steps, in the order they run:
     attention      the K2 fused attention suite; needs test-gpu-experiments
     cascade        the cascade suite
     dram           the device-memory bytes run (make dram-cascade); needs the counters
+    plan-cost      the cost of planning one cascade step (python -m bench.plan_cost)
     old-torch      the package's GPU tests (tests/ only) again with torch 2.13.0 and
                    Triton 3.7.1, in a separate environment (the release's lowest
                    supported versions); experiments/ follows the lock file only
+    test-vllm      vLLM 0.33.0 with kvkernels and the kvkernels-vllm backend in a
+                   separate environment, then the backend's GPU tests (a small model,
+                   every decode call checked against vLLM's kernel and fp32)
+    serving        the serving benchmark (python -m bench.serving --gsm8k) in that
+                   environment; needs test-vllm. The model is
+                   $KVKERNELS_SERVING_MODEL, Llama 3.1 8B Instruct by default, which
+                   needs a Hugging Face token with access on the machine
 
 Each step runs the command its Makefile target runs, without make, which some
 GPU images lack. If env fails (no usable GPU), nothing else runs. A step that writes results
@@ -60,6 +68,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 OLD_TORCH_ENV = Path("/tmp/kvkernels-torch-2.13")
 OLD_TORCH_INDEX = "https://download.pytorch.org/whl/cu126"
+VLLM_ENV = Path("/tmp/kvkernels-vllm")
+SERVING_MODEL = "meta-llama/Llama-3.1-8B-Instruct"
 
 
 @dataclass(frozen=True)
@@ -106,6 +116,22 @@ STEPS = (
         f" && uv pip install -q -p {OLD_TORCH_ENV} triton==3.7.1 numpy pytest"
         f" && KVKERNELS_REQUIRE_GPU=1 PYTHONPATH=src:."
         f" {OLD_TORCH_ENV}/bin/python -m pytest tests -m gpu -v -p no:cacheprovider",
+    ),
+    Step(
+        "test-vllm",
+        f"uv venv -q --allow-existing -p 3.12 {VLLM_ENV}"
+        f" && uv pip install -q -p {VLLM_ENV} vllm==0.33.0 'lm-eval[api]' pytest"
+        f" && uv pip install -q -p {VLLM_ENV} -e . -e integrations/vllm"
+        f" && KVKERNELS_REQUIRE_GPU=1 {VLLM_ENV}/bin/python -m pytest integrations/vllm/tests"
+        " -v -p no:cacheprovider",
+        needs=RESULT_TESTS,
+    ),
+    Step(
+        "serving",
+        f"{VLLM_ENV}/bin/python -m bench.serving --gsm8k"
+        f" --model ${{KVKERNELS_SERVING_MODEL:-{SERVING_MODEL}}}",
+        writes_results=True,
+        needs=(*RESULT_TESTS, "test-vllm"),
     ),
 )
 STEP_NAMES = tuple(s.name for s in STEPS)

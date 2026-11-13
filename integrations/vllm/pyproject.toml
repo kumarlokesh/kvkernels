@@ -1,0 +1,15 @@
+[project]
+name = "kvkernels-vllm"
+version = "0.0.0"
+description = "kvkernels' cascade decode attention as an attention backend for vLLM 0.33.0"
+requires-python = ">=3.11"
+license = "Apache-2.0"
+# One vLLM release: the backend subclasses vLLM's Triton backend and its metadata.
+dependencies = ["kvkernels", "vllm==0.33.0"]
+
+[project.entry-points."vllm.general_plugins"]
+kvkernels = "kvkernels_vllm:register"
+
+[build-system]
+requires = ["uv_build>=0.13,<0.14"]
+build-backend = "uv_build"

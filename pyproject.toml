@@ -71,6 +71,7 @@ explicit = true
 [tool.ruff]
 line-length = 100
 target-version = "py311"
+src = [".", "src", "integrations/vllm/src"]
 # Copied from other projects and kept byte for byte; see each file's header.
 extend-exclude = [
     "bench/baselines/vllm/swap_blocks_triton.py",
@@ -89,8 +90,17 @@ select = ["E", "F", "W", "I", "UP", "B", "SIM", "RUF"]
 [tool.mypy]
 python_version = "3.11"
 strict = true
-files = ["src", "bench", "scripts", "tests", "experiments", "examples"]
-mypy_path = ["src", "."]
+files = [
+    "src",
+    "bench",
+    "scripts",
+    "tests",
+    "experiments",
+    "examples",
+    "integrations/vllm/src",
+    "integrations/vllm/tests",
+]
+mypy_path = ["src", ".", "integrations/vllm/src"]
 explicit_package_bases = true
 exclude = [
     "bench/baselines/vllm/swap_blocks_triton\\.py",
@@ -99,8 +109,27 @@ exclude = [
 ]
 
 [[tool.mypy.overrides]]
-module = ["triton", "triton.*", "matplotlib", "matplotlib.*", "cuda", "cuda.*", "flashinfer", "flashinfer.*"]
+module = [
+    "triton",
+    "triton.*",
+    "matplotlib",
+    "matplotlib.*",
+    "cuda",
+    "cuda.*",
+    "flashinfer",
+    "flashinfer.*",
+    "vllm",
+    "vllm.*",
+    "huggingface_hub",
+    "huggingface_hub.*",
+]
 ignore_missing_imports = true
+
+# The vLLM backend subclasses vLLM classes, which mypy sees as untyped where vLLM
+# is not installed.
+[[tool.mypy.overrides]]
+module = ["kvkernels_vllm.backend"]
+disallow_subclassing_any = false
 
 # Experiment kernels and their tests use Triton's untyped decorator and pytest fixtures.
 [[tool.mypy.overrides]]
@@ -134,7 +163,7 @@ disallow_untyped_defs = false
 disallow_incomplete_defs = false
 
 [tool.pytest.ini_options]
-testpaths = ["tests", "experiments"]
-pythonpath = ["."]
+testpaths = ["tests", "experiments", "integrations/vllm/tests"]
+pythonpath = [".", "integrations/vllm/src"]
 addopts = "-ra --strict-markers"
 markers = ["gpu: needs a CUDA GPU; skipped in CI and the devcontainer"]
