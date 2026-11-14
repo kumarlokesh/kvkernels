@@ -41,6 +41,12 @@ HF_TOKEN = Path.home() / ".cache" / "huggingface" / "token"
 UV_VERSION = "0.13.5"
 REMOTE_REPO = "kvkernels"  # under the remote home directory
 REMOTE_SESSIONS = "sessions"
+CUDA = "12.6"  # torch's CUDA build (the cu126 extra)
+CUDA_PKG = CUDA.replace(".", "-")
+CUDA_KEYRING = (
+    "https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/"
+    "cuda-keyring_1.1-1_all.deb"
+)
 INSTALL = "uv sync --locked --extra cu126 --extra bench --extra baselines"
 
 # Runs on the VM after the bundle is copied. FlashInfer links the kernels it
@@ -49,6 +55,13 @@ INSTALL = "uv sync --locked --extra cu126 --extra bench --extra baselines"
 SETUP_SCRIPT = f"""set -e
 # A C compiler and Python's headers: Triton builds its launcher against both.
 sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq build-essential python3-dev >/dev/null
+# The CUDA toolkit matching torch's build: FlashInfer compiles its kernels with
+# nvcc on first use, and the profiling steps use its Nsight Compute.
+if [ ! -x /usr/local/cuda-{CUDA}/bin/nvcc ]; then
+  curl -fsSLo /tmp/cuda-keyring.deb {CUDA_KEYRING}
+  sudo dpkg -i /tmp/cuda-keyring.deb && sudo apt-get update -qq
+  sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq cuda-toolkit-{CUDA_PKG} >/dev/null
+fi
 command -v uv >/dev/null || curl -LsSf https://astral.sh/uv/{UV_VERSION}/install.sh | sh
 export PATH="$HOME/.local/bin:$PATH"
 rm -rf ~/{REMOTE_REPO} && tar -xzf ~/kvkernels-bundle.tar.gz -C ~ && rm ~/kvkernels-bundle.tar.gz
@@ -92,7 +105,9 @@ def run_command(stamp: str, steps: str | None, sha: str) -> str:
     if steps:
         session += f" --steps {shlex.quote(steps)}"
     env = (
-        'export PATH="$HOME/.local/bin:$PATH" LIBRARY_PATH="$HOME/cuda-link:$LIBRARY_PATH"'
+        f'export PATH="$HOME/.local/bin:/usr/local/cuda-{CUDA}/bin:$PATH"'
+        f" CUDA_HOME=/usr/local/cuda-{CUDA}"
+        ' LIBRARY_PATH="$HOME/cuda-link:$LIBRARY_PATH"'
         f" KVKERNELS_GIT_SHA={shlex.quote(sha)} UV_NO_SYNC=1 PYTHONUNBUFFERED=1"
     )
     return (
