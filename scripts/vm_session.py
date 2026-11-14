@@ -118,7 +118,8 @@ def run_command(stamp: str, steps: str | None, sha: str) -> str:
 
 
 STATUS_COMMAND = f"""latest=$(ls -t ~/{REMOTE_SESSIONS}/*.log 2>/dev/null | head -1)
-if pgrep -f "gpu_session.py run" >/dev/null; then echo RUNNING; else echo IDLE; fi
+# [g]: the pattern must not match this shell, whose command line holds the pattern.
+if pgrep -f "[g]pu_session.py run" >/dev/null; then echo RUNNING; else echo IDLE; fi
 [ -n "$latest" ] && echo "$latest" && tail -n 15 "$latest"
 """
 

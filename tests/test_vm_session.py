@@ -51,3 +51,7 @@ def test_setup_installs_what_triton_and_flashinfer_compile_with() -> None:
 def test_the_token_is_copied_as_a_file_and_never_echoed() -> None:
     assert "token" not in vm_session.SETUP_SCRIPT
     assert "token" not in vm_session.run_command("s", None, "abc")
+
+
+def test_status_does_not_find_its_own_shell() -> None:
+    assert 'pgrep -f "[g]pu_session.py run"' in vm_session.STATUS_COMMAND
