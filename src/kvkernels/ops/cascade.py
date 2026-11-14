@@ -44,7 +44,7 @@ from dataclasses import dataclass
 import torch
 
 from kvkernels.ops._registry import registered_op
-from kvkernels.ops.cascade_plan import MAX_PLAN_REQUESTS, plan_on_device
+from kvkernels.ops.cascade_plan import MAX_PLAN_REQUESTS, PlanGraphs, plan_on_device
 from kvkernels.ops.merge_states import merge_ragged
 from kvkernels.ops.prefix_attention import attend
 
@@ -175,6 +175,8 @@ class CascadePlan:
         self.prefix_tasks = tuple(self.tasks[0])
         self.suffix_tasks = tuple(self.tasks[1])
         self.counts = ints(5)  # prefix tasks, suffix tasks, merge rows, groups, items
+        self.planned_requests = ints(1)  # device planning: the batch size, read by the kernels
+        self.graphs = PlanGraphs()  # device planning: recorded launches, replayed each step
         self.merge_start = ints(self.max_rows)
         self.merge_end = ints(self.max_rows)
         self.merge_indices = ints(self.max_parts)

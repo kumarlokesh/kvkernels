@@ -494,6 +494,28 @@ def test_batch_invariant_on_the_gpu() -> None:
 
 
 @pytest.mark.gpu
+def test_planning_replays_one_graph_while_the_batch_size_changes() -> None:
+    """An engine passes the first rows of the same block table and length buffers each step."""
+    batch = chains_batch(random.Random(6), requests=24, block_size=16)
+    s = build(batch, q_heads=32, kv_heads=8, head_dim=128)
+    table, lens = s.index["block_table"], s.index["seq_lens"]
+    plan = new_plan(s, batch, max_groups=12, min_shared_tokens=16)
+    for n in (24, 24, 17, 9, 24, 1):
+        step = Setup(
+            s.q[:n], s.k, s.v, {"block_table": table[:n], "seq_lens": lens[:n]}, s.requests[:n]
+        )
+        plan_device(plan, step)
+        check(step, *attend(step, plan))
+        fresh = new_plan(s, batch, max_groups=12, min_shared_tokens=16)
+        plan_device(fresh, step)  # a first call launches the kernels directly
+        assert found_groups(plan) == found_groups(fresh)
+        assert torch.equal(plan.counts, fresh.counts)
+        rows = n * plan.num_q_heads
+        assert torch.equal(plan.merge_start[:rows], fresh.merge_start[:rows])
+    assert len(plan.graphs.graphs) == 1
+
+
+@pytest.mark.gpu
 def test_planning_and_attention_capture_in_one_cuda_graph() -> None:
     first = chains_batch(random.Random(4), requests=24, block_size=16)
     second = chains_batch(random.Random(5), requests=24, block_size=16)

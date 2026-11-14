@@ -28,14 +28,17 @@ pages whole and places token t at offset t % page_size of its page, so two
 requests with the same first slot in a page share the whole page.
 
 A group shares a whole number of KV blocks, so every member's suffix starts at
-the beginning of a KV block. Sizes are fixed by the plan's maxima, so the four
-launches capture in a CUDA graph. Nothing raises on the device: when the
-batch's split-K partial results or tasks would exceed the plan's capacity,
-every item falls back to one range, and runs past max_groups stay ungrouped.
+the beginning of a KV block. Sizes are fixed by the plan's maxima and the batch
+size is read from the device, so the four launches capture in a CUDA graph, and
+the plan records its own graph to replay on later steps (PlanGraphs). Nothing
+raises on the device: when the batch's split-K partial results or tasks would
+exceed the plan's capacity, every item falls back to one range, and runs past
+max_groups stay ungrouped.
 """
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import TYPE_CHECKING
 
 import torch
@@ -79,12 +82,13 @@ def _order_kernel(  # type: ignore[no-untyped-def]
     starts_ptr,
     seq_lens_ptr,
     perm_ptr,
-    num_requests,
+    num_requests_ptr,
     stride_r,
     block_size,
     PER_TOKEN: tl.constexpr,
     BLOCK_R: tl.constexpr,
 ):
+    num_requests = tl.load(num_requests_ptr)
     i = tl.arange(0, BLOCK_R)
     ok = i < num_requests
     length = tl.load(seq_lens_ptr + i, mask=ok, other=0)
@@ -104,7 +108,7 @@ def _common_kernel(  # type: ignore[no-untyped-def]
     seq_lens_ptr,
     perm_ptr,
     common_ptr,
-    num_requests,
+    num_requests_ptr,
     stride_r,
     block_size,
     PER_TOKEN: tl.constexpr,
@@ -112,7 +116,7 @@ def _common_kernel(  # type: ignore[no-untyped-def]
 ):
     """Program i: KV blocks that sorted row i shares with sorted row i - 1 from the start."""
     i = tl.program_id(0)
-    if i >= num_requests:
+    if i >= tl.load(num_requests_ptr):
         return
     if i == 0:
         tl.store(common_ptr, 0)
@@ -205,7 +209,7 @@ def _items_kernel(  # type: ignore[no-untyped-def]
     counts_ptr,  # prefix tasks, suffix tasks, merge rows, groups, items
     merge_start_ptr,
     merge_end_ptr,
-    num_requests,
+    num_requests_ptr,
     stride_r,
     block_size,
     min_shared_blocks,
@@ -225,6 +229,7 @@ def _items_kernel(  # type: ignore[no-untyped-def]
     INVARIANT: tl.constexpr,
     BLOCK_R: tl.constexpr,
 ):
+    num_requests = tl.load(num_requests_ptr)
     i = tl.arange(0, BLOCK_R)
     ok = i < num_requests
     request = tl.load(perm_ptr + i, mask=ok, other=0)
@@ -434,6 +439,153 @@ def _warps(block: int) -> int:
     return 4 if block <= 512 else 8 if block <= 2048 else 16
 
 
+Launch = Callable[[], None]
+
+
+def planning_launches(
+    plan: CascadePlan,
+    *,
+    index: torch.Tensor,
+    starts: torch.Tensor | None,
+    seq_lens: torch.Tensor,
+    stride_r: int,
+) -> list[tuple[str, Launch]]:
+    """The four planning launches, by name, in order; see the module docstring.
+
+    They read the batch size from plan.planned_requests, which the caller sets
+    first. starts is None for a block table (row r begins at r · stride_r) and
+    holds each request's first slot for a slot list.
+    """
+    per_token = starts is not None
+    starts_arg = starts if starts is not None else seq_lens  # unused for a block table
+    block_r = max(16, triton.next_power_of_2(plan.max_requests))
+    interpreting = plan.device.type != "cuda"
+    max_items = plan.max_groups + plan.max_requests
+    order_args = (index, starts_arg, seq_lens, plan.perm)
+
+    def order() -> None:
+        _order_kernel[(1,)](
+            *order_args,
+            plan.planned_requests,
+            stride_r,
+            plan.block_size,
+            PER_TOKEN=per_token,
+            BLOCK_R=block_r,
+            num_warps=_warps(block_r),
+        )
+
+    def common() -> None:
+        _common_kernel[(plan.max_requests,)](
+            *order_args,
+            plan.common,
+            plan.planned_requests,
+            stride_r,
+            plan.block_size,
+            PER_TOKEN=per_token,
+            BLOCK_W=16 if interpreting else 64,
+        )
+
+    def items() -> None:
+        _items_kernel[(1,)](
+            *order_args,
+            plan.common,
+            plan.item_req_start,
+            plan.item_num_reqs,
+            plan.item_block_start,
+            plan.item_info,
+            plan.counts,
+            plan.merge_start,
+            plan.merge_end,
+            plan.planned_requests,
+            stride_r,
+            plan.block_size,
+            plan.min_shared_blocks,
+            plan.max_groups,
+            max_items,
+            plan.max_tasks,
+            plan.max_parts,
+            plan.programs_per_sm * plan.num_sms,
+            plan.min_split_tokens,
+            plan.block_n,
+            plan.num_kv_heads,
+            plan.num_q_heads,
+            GROUP=plan.group,
+            PREFIX_BM=plan.prefix_block_m,
+            MAX_SPLITS=plan.max_splits,
+            PER_TOKEN=per_token,
+            INVARIANT=plan.batch_invariant,
+            BLOCK_R=block_r,
+            num_warps=_warps(block_r),
+        )
+
+    def fill() -> None:
+        _fill_kernel[(max_items,)](
+            plan.perm,
+            plan.item_req_start,
+            plan.item_num_reqs,
+            plan.item_info,
+            plan.counts,
+            plan.tasks,
+            plan.merge_start,
+            plan.merge_indices,
+            max_items,
+            plan.max_tasks,
+            plan.num_kv_heads,
+            plan.num_q_heads,
+            GROUP=plan.group,
+            PREFIX_BM=plan.prefix_block_m,
+            SUFFIX_BM=plan.suffix_block_m,
+            BLOCK=64 if interpreting else 256,
+        )
+
+    return [("order", order), ("common", common), ("items", items), ("fill", fill)]
+
+
+MAX_PLAN_GRAPHS = 8  # input sets one plan keeps a graph for
+_MAX_SEEN = 64  # input sets remembered while waiting for a second call
+
+
+class PlanGraphs:
+    """The planning launches recorded in CUDA graphs, one graph per set of inputs.
+
+    Launching four Triton kernels from Python costs about 30 µs of CPU each; a
+    graph replay costs one launch. A graph holds the addresses of the index and
+    length tensors it was recorded with, so it serves only calls that pass the
+    same tensors. An engine does: it keeps its block table and lengths in
+    persistent buffers and passes a slice of the first rows each step. The batch
+    size, which changes every step, is read from the device.
+
+        call 1 with inputs X   launch the four kernels (and compile them)
+        call 2 with inputs X   record the four launches in a graph, replay it
+        call 3+ with inputs X  replay
+
+    Waiting for the second call keeps a one-off call from paying for a
+    recording, which synchronizes the device. Past MAX_PLAN_GRAPHS input sets,
+    calls launch the kernels directly. Inside another stream's capture the
+    kernels are launched directly too, and the outer graph records them.
+    """
+
+    def __init__(self) -> None:
+        self.graphs: dict[tuple[object, ...], torch.cuda.CUDAGraph] = {}
+        self.seen: set[tuple[object, ...]] = set()
+
+    def run(self, key: tuple[object, ...], launches: list[Launch]) -> None:
+        graph = self.graphs.get(key)
+        if graph is None and key in self.seen and len(self.graphs) < MAX_PLAN_GRAPHS:
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph, capture_error_mode="thread_local"):
+                for launch in launches:
+                    launch()
+            self.graphs[key] = graph
+        if graph is not None:
+            graph.replay()
+            return
+        if len(self.seen) < _MAX_SEEN:
+            self.seen.add(key)
+        for launch in launches:
+            launch()
+
+
 def plan_on_device(
     plan: CascadePlan,
     *,
@@ -445,79 +597,25 @@ def plan_on_device(
     """Fill the plan's buffers from an index on the device; see the module docstring.
 
     starts is None for a block table (row r begins at r · stride_r) and holds
-    each request's first slot for a slot list.
+    each request's first slot for a slot list. On a GPU the launches replay
+    from a graph when the same tensors were passed before (PlanGraphs).
     """
-    num_req = seq_lens.shape[0]
-    per_token = starts is not None
-    starts_arg = starts if starts is not None else seq_lens  # unused for a block table
-    block_r = max(16, triton.next_power_of_2(plan.max_requests))
-    interpreting = plan.device.type != "cuda"
-    max_items = plan.max_groups + plan.max_requests
-    order_args = (index, starts_arg, seq_lens, plan.perm)
-    _order_kernel[(1,)](
-        *order_args,
-        num_req,
+    plan.planned_requests.fill_(seq_lens.shape[0])
+    launches = [
+        launch
+        for _, launch in planning_launches(
+            plan, index=index, starts=starts, seq_lens=seq_lens, stride_r=stride_r
+        )
+    ]
+    if plan.device.type != "cuda" or torch.cuda.is_current_stream_capturing():
+        for launch in launches:
+            launch()
+        return
+    key = (
+        index.data_ptr(),
+        index.dtype,
+        starts.data_ptr() if starts is not None else 0,
+        seq_lens.data_ptr(),
         stride_r,
-        plan.block_size,
-        PER_TOKEN=per_token,
-        BLOCK_R=block_r,
-        num_warps=_warps(block_r),
     )
-    _common_kernel[(plan.max_requests,)](
-        *order_args,
-        plan.common,
-        num_req,
-        stride_r,
-        plan.block_size,
-        PER_TOKEN=per_token,
-        BLOCK_W=16 if interpreting else 64,
-    )
-    _items_kernel[(1,)](
-        *order_args,
-        plan.common,
-        plan.item_req_start,
-        plan.item_num_reqs,
-        plan.item_block_start,
-        plan.item_info,
-        plan.counts,
-        plan.merge_start,
-        plan.merge_end,
-        num_req,
-        stride_r,
-        plan.block_size,
-        plan.min_shared_blocks,
-        plan.max_groups,
-        max_items,
-        plan.max_tasks,
-        plan.max_parts,
-        plan.programs_per_sm * plan.num_sms,
-        plan.min_split_tokens,
-        plan.block_n,
-        plan.num_kv_heads,
-        plan.num_q_heads,
-        GROUP=plan.group,
-        PREFIX_BM=plan.prefix_block_m,
-        MAX_SPLITS=plan.max_splits,
-        PER_TOKEN=per_token,
-        INVARIANT=plan.batch_invariant,
-        BLOCK_R=block_r,
-        num_warps=_warps(block_r),
-    )
-    _fill_kernel[(max_items,)](
-        plan.perm,
-        plan.item_req_start,
-        plan.item_num_reqs,
-        plan.item_info,
-        plan.counts,
-        plan.tasks,
-        plan.merge_start,
-        plan.merge_indices,
-        max_items,
-        plan.max_tasks,
-        plan.num_kv_heads,
-        plan.num_q_heads,
-        GROUP=plan.group,
-        PREFIX_BM=plan.prefix_block_m,
-        SUFFIX_BM=plan.suffix_block_m,
-        BLOCK=64 if interpreting else 256,
-    )
+    plan.graphs.run(key, launches)

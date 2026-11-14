@@ -13,4 +13,6 @@ from bench import plan_cost  # noqa: E402
 def test_every_measurement_is_positive() -> None:
     (row,) = plan_cost.measure(batches=(16,), calls=5)
     assert row.batch == 16
-    assert min(row.host_plan_us, row.gpu_plan_cpu_us, row.gpu_plan_us, row.graph_step_us) > 0
+    times = (row.host_plan_us, row.launches_cpu_us, row.gpu_plan_cpu_us, row.gpu_plan_us)
+    assert min(*times, row.graph_step_us, *row.kernel_us.values()) > 0
+    assert list(row.kernel_us) == ["order", "common", "items", "fill"]

@@ -191,7 +191,6 @@ class KvkernelsAttentionImpl(TritonAttentionImpl):
         n = attn_metadata.num_decode_tokens
         if n:
             calls.decode += 1
-        if n:
             assert attn_metadata.plan is not None
             q = query[:n].view(n, self.num_heads, self.head_size)
             out = output[:n].view(n, self.num_heads, self.head_size)
