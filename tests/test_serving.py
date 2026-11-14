@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 
 import pytest
@@ -43,7 +44,8 @@ def test_bench_command_fixes_lengths_and_greedy_output() -> None:
 
 def test_serve_command_selects_the_backend_and_caps_the_context() -> None:
     cmd = serving.serve_command("m", "CUSTOM")
-    assert cmd[:3] == ["vllm", "serve", "m"]
+    assert Path(cmd[0]).name == "vllm"
+    assert cmd[1:3] == ["serve", "m"]
     assert cmd[cmd.index("--attention-backend") + 1] == "CUSTOM"
     assert cmd[cmd.index("--max-model-len") + 1] == str(serving.MAX_MODEL_LEN)
 
@@ -108,3 +110,13 @@ def test_result_file_round_trips(tmp_path: Path) -> None:
     assert serving.read_result(path) == result
     with pytest.raises(FileExistsError):
         serving.write_result(result, tmp_path)
+
+
+def test_tools_come_from_the_venv_of_the_running_python(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / "bin").mkdir()
+    (tmp_path / "bin" / "vllm").touch()
+    monkeypatch.setattr(sys, "executable", str(tmp_path / "bin" / "python"))
+    assert serving.tool("vllm") == str(tmp_path / "bin" / "vllm")
+    assert serving.tool("lm_eval") == "lm_eval"  # not installed there: found on PATH

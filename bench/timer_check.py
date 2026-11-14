@@ -1,20 +1,30 @@
-"""Check whether the do_bench L2 flush hides kernel launch overhead.
+"""Compare the harness timer and its candidate replacements with Nsight Compute.
 
 Usage on a GPU machine: ``python -m bench.timer_check`` (or ``make check-timer``).
 
-For each probe kernel, compares three medians:
+Each timer runs every probe kernel with L2 cleared before each call. Two ways of
+clearing L2 are compared, because they leave L2 in different states:
 
-- do_bench: the harness timer (flush, start event, kernel, end event).
-- graph: a CUDA graph of [flush, kernel] x N minus a graph of [flush] x N, divided
-  by N. No launch overhead; the fallback timer for small kernels.
-- ncu: Nsight Compute's gpu__time_duration for the kernel alone, with caches
-  flushed (--cache-control all) and clocks left alone (--clock-control none);
-  by default ncu locks clocks to base, which would make it disagree with
-  do_bench for a reason unrelated to launch overhead.
+    zero flush   write zeros over a 256 MiB buffer (what do_bench does); L2 is
+                 left full of modified lines, which the timed kernel then pays
+                 to write back to device memory when it evicts them
+    read flush   sum a 256 MiB buffer; L2 is left full of unmodified lines,
+                 which cost nothing to evict
 
-If do_bench is within 10% of ncu for every small probe, the flush hides launch
-overhead and the harness timer stays. Otherwise kernels under 50 us move to the
-graph timer.
+Timers, each reporting a median in microseconds:
+
+    do_bench     the harness timer: zero flush, start event, kernel, end event
+    events_read  the same loop with the read flush
+    graph_zero   a CUDA graph of [zero flush, kernel] x N minus a graph of
+                 [zero flush] x N, divided by N: no launch overhead
+    graph_read   the same with the read flush
+    ncu          Nsight Compute's gpu__time_duration for the kernel alone, with
+                 caches written back and emptied before each launch
+                 (--cache-control all) and clocks left alone (--clock-control
+                 none; by default ncu locks clocks to base)
+
+Nsight Compute is the reference. The report names the first timer, in the
+order above, that is within 10% of Nsight Compute for every probe under 50 us.
 """
 
 from __future__ import annotations
@@ -35,6 +45,8 @@ NVTX_RANGE = "probe"
 NCU_LAUNCHES = 50
 GRAPH_CALLS = 100
 GRAPH_REPLAYS = 20
+EVENT_SAMPLES = 200
+TIMERS = ("do_bench", "events_read", "graph_zero", "graph_read")  # order of preference
 
 _UNIT_TO_NS = {
     "ns": 1.0,
@@ -51,18 +63,15 @@ _UNIT_TO_NS = {
 @dataclass(frozen=True)
 class ProbeResult:
     name: str
-    do_bench_us: float
-    graph_us: float
     ncu_us: float
+    timers_us: dict[str, float]
 
-    @property
-    def overhead_fraction(self) -> float:
-        """How much longer do_bench measures than ncu, as a fraction of ncu."""
-        return self.do_bench_us / self.ncu_us - 1.0
+    def error(self, timer: str) -> float:
+        """How much longer the timer measures than ncu, as a fraction of ncu."""
+        return self.timers_us[timer] / self.ncu_us - 1.0
 
-    @property
-    def hidden(self) -> bool:
-        return abs(self.overhead_fraction) <= TOLERANCE
+    def within(self, timer: str) -> bool:
+        return abs(self.error(timer)) <= TOLERANCE
 
 
 def parse_ncu_durations_ns(csv_text: str) -> list[float]:
@@ -85,9 +94,11 @@ def parse_ncu_durations_ns(csv_text: str) -> list[float]:
 
 def decision(results: Sequence[ProbeResult]) -> str:
     small = [r for r in results if r.ncu_us < SMALL_KERNEL_US]
-    if all(r.hidden for r in small):
-        return "keep do_bench: the flush hides launch overhead for every probe"
-    return f"switch kernels under {SMALL_KERNEL_US:.0f} us to the graph timer"
+    rule = f"within {TOLERANCE:.0%} of ncu for every probe under {SMALL_KERNEL_US:.0f} us"
+    for timer in TIMERS:
+        if all(r.within(timer) for r in small):
+            return f"{timer}: {rule}"
+    return f"no timer is {rule}"
 
 
 # --- GPU side -----------------------------------------------------------------
@@ -113,24 +124,29 @@ def _probes() -> dict[str, Callable[[], Callable[[], None]]]:
 
         return fn
 
-    def gather_64() -> Callable[[], None]:
-        # torch.index_select stands in for kvkernels' own gather kernel: a
-        # 64-block gather of 64 KiB KV blocks from a 1 GiB plane.
-        import torch
+    def gather(blocks: int) -> Callable[[], Callable[[], None]]:
+        # torch.index_select stands in for kvkernels' own gather kernel: a gather
+        # of 64 KiB KV blocks from a 1 GiB plane.
+        def make() -> Callable[[], None]:
+            import torch
 
-        plane = torch.empty(16384, 32768, dtype=torch.float16, device="cuda")
-        ids = torch.randperm(16384, device="cuda")[:64]
-        out = torch.empty(64, 32768, dtype=torch.float16, device="cuda")
+            plane = torch.empty(16384, 32768, dtype=torch.float16, device="cuda")
+            ids = torch.randperm(16384, device="cuda")[:blocks]
+            out = torch.empty(blocks, 32768, dtype=torch.float16, device="cuda")
 
-        def fn() -> None:
-            torch.index_select(plane, 0, ids, out=out)
+            def fn() -> None:
+                torch.index_select(plane, 0, ids, out=out)
 
-        return fn
+            return fn
 
-    return {"one_program": one_program, "gather_64": gather_64}
+        return make
+
+    # gather_1024 moves 128 MiB: a kernel far above the small-kernel threshold,
+    # where every timer should agree with ncu.
+    return {"one_program": one_program, "gather_64": gather(64), "gather_1024": gather(1024)}
 
 
-def _flush_fn() -> Callable[[], None]:
+def _zero_flush() -> Callable[[], None]:
     from triton import runtime
 
     cache = runtime.driver.active.get_empty_cache_for_benchmark()
@@ -141,16 +157,47 @@ def _flush_fn() -> Callable[[], None]:
     return flush
 
 
+def _read_flush() -> Callable[[], None]:
+    import torch
+    from triton import runtime
+
+    cache = runtime.driver.active.get_empty_cache_for_benchmark()
+    total = torch.empty((), dtype=torch.int64, device=cache.device)
+
+    def flush() -> None:
+        torch.sum(cache, dim=0, dtype=torch.int64, out=total)
+
+    return flush
+
+
 def do_bench_us(fn: Callable[[], None]) -> float:
     from bench.harness import do_bench_samples, summarize, timed_samples
 
     return summarize(timed_samples(fn, do_bench_samples)).median_ms * 1e3
 
 
-def graph_us(fn: Callable[[], None]) -> float:
+def events_us(fn: Callable[[], None], flush: Callable[[], None]) -> float:
+    """do_bench's loop with another flush: flush, start event, fn, end event."""
     import torch
 
-    flush = _flush_fn()
+    fn()
+    flush()
+    torch.cuda.synchronize()
+    event = torch.cuda.Event
+    starts = [event(enable_timing=True) for _ in range(EVENT_SAMPLES)]  # type: ignore[no-untyped-call]
+    ends = [event(enable_timing=True) for _ in range(EVENT_SAMPLES)]  # type: ignore[no-untyped-call]
+    for start, end in zip(starts, ends, strict=True):
+        flush()
+        start.record()
+        fn()
+        end.record()
+    torch.cuda.synchronize()
+    times = [float(s.elapsed_time(e)) for s, e in zip(starts, ends, strict=True)]
+    return statistics.median(times) * 1e3
+
+
+def graph_us(fn: Callable[[], None], flush: Callable[[], None]) -> float:
+    import torch
 
     def capture(body: Callable[[], None]) -> torch.cuda.CUDAGraph:
         graph = torch.cuda.CUDAGraph()
@@ -180,6 +227,16 @@ def graph_us(fn: Callable[[], None]) -> float:
 
     samples = [(replay_ms(g_both) - replay_ms(g_flush)) / GRAPH_CALLS for _ in range(GRAPH_REPLAYS)]
     return statistics.median(samples) * 1e3
+
+
+def all_timers_us(fn: Callable[[], None]) -> dict[str, float]:
+    zero, read = _zero_flush(), _read_flush()
+    return {
+        "do_bench": do_bench_us(fn),
+        "events_read": events_us(fn, read),
+        "graph_zero": graph_us(fn, zero),
+        "graph_read": graph_us(fn, read),
+    }
 
 
 def ncu_us(probe: str) -> float:
@@ -255,21 +312,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     results = []
     for name, make in _probes().items():
         fn = make()
-        results.append(ProbeResult(name, do_bench_us(fn), graph_us(fn), ncu_us(name)))
+        results.append(ProbeResult(name, ncu_us(name), all_timers_us(fn)))
 
     print(
         f"GPU {info.gpu_name}, driver {info.driver_version}, torch {info.torch_version},"
         f" triton {info.triton_version}"
     )
-    print(
-        f"{'probe':12s} {'do_bench us':>12s} {'graph us':>10s}"
-        f" {'ncu us':>10s} {'do_bench/ncu':>13s}"
-    )
+    print(f"{'probe':12s} {'ncu us':>9s} " + " ".join(f"{t:>18s}" for t in TIMERS))
     for r in results:
-        print(
-            f"{r.name:12s} {r.do_bench_us:12.2f} {r.graph_us:10.2f} {r.ncu_us:10.2f}"
-            f" {r.overhead_fraction:+12.1%}"
-        )
+        cells = " ".join(f"{r.timers_us[t]:9.2f} ({r.error(t):+6.0%})" for t in TIMERS)
+        print(f"{r.name:12s} {r.ncu_us:9.2f} {cells}")
     print(decision(results))
     return 0
 

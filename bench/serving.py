@@ -151,9 +151,15 @@ class ServingResult:
 # --- commands ---------------------------------------------------------------------
 
 
+def tool(name: str) -> str:
+    """A command installed next to this Python, so it runs without activating its venv."""
+    path = Path(sys.executable).parent / name  # not resolved: the venv's bin, not the base's
+    return str(path) if path.exists() else name
+
+
 def serve_command(model: str, backend: str, port: int = PORT) -> list[str]:
     return [
-        "vllm",
+        tool("vllm"),
         "serve",
         model,
         "--attention-backend",
@@ -178,7 +184,7 @@ def bench_command(
     port: int = PORT,
 ) -> list[str]:
     return [
-        "vllm",
+        tool("vllm"),
         "bench",
         "serve",
         "--backend",
@@ -213,7 +219,7 @@ def bench_command(
 
 def gsm8k_command(model: str, out_dir: Path, port: int = PORT) -> list[str]:
     return [
-        "lm_eval",
+        tool("lm_eval"),
         "--model",
         "local-completions",
         "--model_args",
