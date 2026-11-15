@@ -126,6 +126,21 @@ def test_split_settings_run_only_at_small_batch() -> None:
     assert not set(suite.SPLIT_SETTINGS) & set(large)
 
 
+@pytest.mark.parametrize(("seq_len", "block_size"), [(48, 16), (640, 16), (5, 1), (129, 16)])
+def test_vllm_block_table_holds_every_entry_of_the_last_tile(seq_len: int, block_size: int) -> None:
+    # vLLM's kernel loads the block-table entries of a whole tile without a mask.
+    from bench.baselines.vllm.unified_attention_adapter import LARGEST_TILE, plan_decode
+
+    blocks = -(-seq_len // block_size)
+    step = plan_decode(
+        [list(range(1, blocks + 1))] * 2, [seq_len] * 2, 8, 2, 16, block_size, torch.device("cpu")
+    )
+    last_tile_end = -(-seq_len // LARGEST_TILE) * LARGEST_TILE
+    assert step.block_table.shape[1] * block_size >= last_tile_end
+    assert step.block_table[:, :blocks].tolist() == [list(range(1, blocks + 1))] * 2
+    assert not step.block_table[:, blocks:].any()
+
+
 @needs_kernels
 @pytest.mark.parametrize(
     "changes",

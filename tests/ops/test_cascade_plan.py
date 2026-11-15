@@ -360,6 +360,20 @@ def test_one_plan_alternates_between_host_and_device_planning() -> None:
 # --- capacity fallbacks -----------------------------------------------------------
 
 
+def test_programs_loop_when_the_batch_has_more_work_than_the_grid() -> None:
+    # One SM and one program per SM: a handful of attention programs per KV head
+    # and 32 merge programs, so each program runs several tasks and merges
+    # several rows.
+    batch = chains_batch(random.Random(9), requests=12, block_size=4)
+    setup = build(batch)
+    plan = new_plan(setup, batch, num_sms=1, programs_per_sm=1)
+    plan_device(plan, setup)
+    tasks = int(plan.counts[0]) + int(plan.counts[1])
+    assert plan.task_programs < tasks
+    assert plan.merge_programs < int(plan.counts[2])
+    check(setup, *attend(setup, plan))
+
+
 def test_split_k_falls_back_to_one_range_when_parts_do_not_fit() -> None:
     shared = list(range(1, 13))
     batch = explicit_batch([[*shared, 13], [*shared, 14], list(range(15, 27))], [52, 50, 48], 4)

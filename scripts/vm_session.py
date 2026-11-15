@@ -110,9 +110,12 @@ def run_command(stamp: str, steps: str | None, sha: str) -> str:
         ' LIBRARY_PATH="$HOME/cuda-link:$LIBRARY_PATH"'
         f" KVKERNELS_GIT_SHA={shlex.quote(sha)} UV_NO_SYNC=1 PYTHONUNBUFFERED=1"
     )
+    # The launch sits in its own subshell: a bare `a && b && c &` would put the
+    # whole chain in the background with SSH's output still open, and SSH would
+    # wait for the session to end before returning.
     return (
         f"mkdir -p ~/{REMOTE_SESSIONS} && cd ~/{REMOTE_REPO} && {env} && "
-        f"setsid nohup sh -c {shlex.quote(session)} > {out}.log 2>&1 < /dev/null & "
+        f"(setsid nohup sh -c {shlex.quote(session)} > {out}.log 2>&1 < /dev/null &) && "
         f"echo {stamp}"
     )
 

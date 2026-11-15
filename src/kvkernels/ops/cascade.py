@@ -49,6 +49,8 @@ from kvkernels.ops.merge_states import merge_ragged
 from kvkernels.ops.prefix_attention import attend
 
 MAX_SPLITS = 16
+TASK_WAVES = 8  # attention programs per KV head: TASK_WAVES · programs_per_sm · SMs / KV heads
+MERGE_PROGRAMS_PER_SM = 32  # merge programs are small; many fit on one SM
 HEAD_DIMS = (64, 128)
 _IN_DTYPES = (torch.float16, torch.bfloat16)
 
@@ -155,6 +157,11 @@ class CascadePlan:
         self.suffix_block_m = suffix_block_m
         self.block_n = block_n or (16 if _interpreting() else 64)
         self.max_rows = max_requests * num_q_heads
+        # Fixed grids that loop over the batch's work, a few times larger than
+        # what the GPU runs at once so that uneven tasks still spread out.
+        resident = programs_per_sm * num_sms
+        self.task_programs = min(self.max_tasks, math.ceil(TASK_WAVES * resident / num_kv_heads))
+        self.merge_programs = min(self.max_rows, MERGE_PROGRAMS_PER_SM * num_sms)
 
         def ints(n: int) -> torch.Tensor:
             return torch.zeros(max(n, 1), dtype=torch.int32, device=device)
@@ -422,6 +429,8 @@ class CascadePlan:
             self.suffix_block_m,
             self.block_n,
             int(self.per_token),
+            self.task_programs,
+            self.merge_programs,
         ]
 
 
@@ -442,7 +451,8 @@ def _cascade_op(
     suffix_tasks = tuple(plan_tensors[10:15])
     counts, merge_start, merge_end, indices = plan_tensors[15:19]
     part_o, part_lse = workspace
-    block_size, group, max_tasks, max_rows, prefix_bm, suffix_bm, block_n, per_token = settings
+    block_size, group, max_tasks, max_rows, prefix_bm, suffix_bm, block_n, per_token = settings[:8]
+    task_programs, merge_programs = settings[8:10]
     common = {
         "index": index,
         "perm": perm,
@@ -457,6 +467,7 @@ def _cascade_op(
         "group": group,
         "max_tasks": max_tasks,
         "block_n": block_n,
+        "num_programs": task_programs,
     }
     attend(q, k, v, tasks=prefix_tasks, num_tasks=counts[0:1], block_m=prefix_bm, **common)  # type: ignore[arg-type]
     attend(q, k, v, tasks=suffix_tasks, num_tasks=counts[1:2], block_m=suffix_bm, **common)  # type: ignore[arg-type]
@@ -470,6 +481,7 @@ def _cascade_op(
         out,
         lse_out,
         max_rows=max_rows,
+        num_programs=merge_programs,
     )
 
 

@@ -6,7 +6,7 @@ shared blocks) or one request's suffix (its own rows over its own blocks). A
 task is one tile of an item's rows over one token range of its block list. An
 item's requests are consecutive rows of the sorted batch; request = perm[row].
 
-Grid: (tasks, KV heads). One program:
+Grid: (task programs, KV heads); each program loops over tasks. One task:
 
     resident                                     per tile of BLOCK_N tokens
     q    BLOCK_M rows · head_dim, gathered:      token t ──▶ block = list[t // block_size],
@@ -20,9 +20,12 @@ Grid: (tasks, KV heads). One program:
     end: each real row writes acc / l and lse = m · ln 2 + ln l to its part slot
 
 K and V are the per-layer views of kvkernels.layouts ([blocks, slots, kv_heads,
-head_dim], any strides), so one kernel reads every supported layout. The grid is
-sized to the plan's capacity: programs past the number of tasks exit at once,
-which keeps a captured CUDA graph valid for any batch up to that capacity.
+head_dim], any strides), so one kernel reads every supported layout. The number
+of tasks is read from the device, and the grid is a fixed number of programs
+that loop over tasks, so a captured CUDA graph serves any batch up to the
+plan's capacity. Sizing the grid to that capacity instead launched up to
+100,000 programs per layer that exited at once, which cost 0.27 ms per layer
+on an L4 for a plan sized for 256 requests.
 """
 
 from __future__ import annotations
@@ -72,84 +75,89 @@ def _work_item_kernel(  # type: ignore[no-untyped-def]
     BLOCK_N: tl.constexpr,
     PER_TOKEN: tl.constexpr,
 ):
-    task = tl.program_id(0)
     kv_head = tl.program_id(1)
-    if task >= tl.load(num_tasks_ptr):
-        return
-    item = tl.load(task_item_ptr + task)
-    row_start = tl.load(task_row_start_ptr + task)
-    tok_start = tl.load(task_tok_start_ptr + task)
-    tok_end = tl.load(task_tok_end_ptr + task)
-    part_base = tl.load(task_part_base_ptr + task).to(tl.int64)
-    req_start = tl.load(item_req_start_ptr + item)
-    block_start = tl.load(item_block_start_ptr + item).to(tl.int64)
-    item_rows = tl.load(item_num_reqs_ptr + item) * GROUP
-    tile_rows = tl.minimum(item_rows - row_start, BLOCK_M)
+    num_tasks = tl.load(num_tasks_ptr)
+    # Program p runs tasks p, p + programs, … below num_tasks, so the grid does
+    # not grow with the plan's capacity (empty programs cost time in a graph).
+    task = tl.program_id(0)
+    while task < num_tasks:
+        item = tl.load(task_item_ptr + task)
+        row_start = tl.load(task_row_start_ptr + task)
+        tok_start = tl.load(task_tok_start_ptr + task)
+        tok_end = tl.load(task_tok_end_ptr + task)
+        part_base = tl.load(task_part_base_ptr + task).to(tl.int64)
+        req_start = tl.load(item_req_start_ptr + item)
+        block_start = tl.load(item_block_start_ptr + item).to(tl.int64)
+        item_rows = tl.load(item_num_reqs_ptr + item) * GROUP
+        tile_rows = tl.minimum(item_rows - row_start, BLOCK_M)
 
-    # Row i of the tile is (request, query head) of this item, for this KV head.
-    rows = tl.arange(0, BLOCK_M)
-    row_ok = rows < tile_rows
-    item_row = row_start + rows
-    request = tl.load(perm_ptr + req_start + item_row // GROUP, mask=row_ok, other=0)
-    q_head = kv_head * GROUP + item_row % GROUP
-    dims = tl.arange(0, HEAD_DIM)
-    q = tl.load(
-        q_ptr
-        + request[:, None].to(tl.int64) * stride_qr
-        + q_head[:, None] * stride_qh
-        + dims[None, :] * stride_qd,
-        mask=row_ok[:, None],
-        other=0.0,
-    )
-
-    m = tl.full((BLOCK_M,), float("-inf"), dtype=tl.float32)
-    l = tl.zeros((BLOCK_M,), dtype=tl.float32)  # noqa: E741
-    acc = tl.zeros((BLOCK_M, HEAD_DIM), dtype=tl.float32)
-    cols = tl.arange(0, BLOCK_N)
-    for start in range(tok_start, tok_end, BLOCK_N):
-        tokens = start + cols
-        tok_ok = tokens < tok_end
-        if PER_TOKEN:
-            entry = tl.load(index_ptr + block_start + tokens, mask=tok_ok, other=0).to(tl.int64)
-            block = entry // block_size
-            slot = entry % block_size
-        else:
-            block = tl.load(index_ptr + block_start + tokens // block_size, mask=tok_ok, other=0)
-            block = block.to(tl.int64)
-            slot = tokens % block_size
-        k = tl.load(
-            k_ptr
-            + block[None, :] * stride_kb
-            + slot[None, :] * stride_ks
-            + kv_head * stride_kh
-            + dims[:, None] * stride_kd,
-            mask=tok_ok[None, :],
+        # Row i of the tile is (request, query head) of this item, for this KV head.
+        rows = tl.arange(0, BLOCK_M)
+        row_ok = rows < tile_rows
+        item_row = row_start + rows
+        request = tl.load(perm_ptr + req_start + item_row // GROUP, mask=row_ok, other=0)
+        q_head = kv_head * GROUP + item_row % GROUP
+        dims = tl.arange(0, HEAD_DIM)
+        q = tl.load(
+            q_ptr
+            + request[:, None].to(tl.int64) * stride_qr
+            + q_head[:, None] * stride_qh
+            + dims[None, :] * stride_qd,
+            mask=row_ok[:, None],
             other=0.0,
         )
-        s = tl.dot(q, k) * scale_log2e
-        s = tl.where(tok_ok[None, :], s, float("-inf"))
-        m_new = tl.maximum(m, tl.max(s, axis=1))
-        alpha = tl.exp2(m - m_new)
-        p = tl.exp2(s - m_new[:, None])
-        l = l * alpha + tl.sum(p, axis=1)  # noqa: E741
-        v = tl.load(
-            v_ptr
-            + block[:, None] * stride_vb
-            + slot[:, None] * stride_vs
-            + kv_head * stride_vh
-            + dims[None, :] * stride_vd,
-            mask=tok_ok[:, None],
-            other=0.0,
-        )
-        acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v)
-        m = m_new
 
-    # Every task covers at least one token, so each real row has l > 0.
-    out = acc / l[:, None]
-    lse = m * 0.6931471805599453 + tl.log(l)  # m is in base-2 units
-    part = part_base + kv_head * tile_rows + rows
-    tl.store(part_o_ptr + part[:, None] * HEAD_DIM + dims[None, :], out, mask=row_ok[:, None])
-    tl.store(part_lse_ptr + part, lse, mask=row_ok)
+        m = tl.full((BLOCK_M,), float("-inf"), dtype=tl.float32)
+        l = tl.zeros((BLOCK_M,), dtype=tl.float32)  # noqa: E741
+        acc = tl.zeros((BLOCK_M, HEAD_DIM), dtype=tl.float32)
+        cols = tl.arange(0, BLOCK_N)
+        for start in range(tok_start, tok_end, BLOCK_N):
+            tokens = start + cols
+            tok_ok = tokens < tok_end
+            if PER_TOKEN:
+                entry = tl.load(index_ptr + block_start + tokens, mask=tok_ok, other=0).to(tl.int64)
+                block = entry // block_size
+                slot = entry % block_size
+            else:
+                block = tl.load(
+                    index_ptr + block_start + tokens // block_size, mask=tok_ok, other=0
+                )
+                block = block.to(tl.int64)
+                slot = tokens % block_size
+            k = tl.load(
+                k_ptr
+                + block[None, :] * stride_kb
+                + slot[None, :] * stride_ks
+                + kv_head * stride_kh
+                + dims[:, None] * stride_kd,
+                mask=tok_ok[None, :],
+                other=0.0,
+            )
+            s = tl.dot(q, k) * scale_log2e
+            s = tl.where(tok_ok[None, :], s, float("-inf"))
+            m_new = tl.maximum(m, tl.max(s, axis=1))
+            alpha = tl.exp2(m - m_new)
+            p = tl.exp2(s - m_new[:, None])
+            l = l * alpha + tl.sum(p, axis=1)  # noqa: E741
+            v = tl.load(
+                v_ptr
+                + block[:, None] * stride_vb
+                + slot[:, None] * stride_vs
+                + kv_head * stride_vh
+                + dims[None, :] * stride_vd,
+                mask=tok_ok[:, None],
+                other=0.0,
+            )
+            acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v)
+            m = m_new
+
+        # Every task covers at least one token, so each real row has l > 0.
+        out = acc / l[:, None]
+        lse = m * 0.6931471805599453 + tl.log(l)  # m is in base-2 units
+        part = part_base + kv_head * tile_rows + rows
+        tl.store(part_o_ptr + part[:, None] * HEAD_DIM + dims[None, :], out, mask=row_ok[:, None])
+        tl.store(part_lse_ptr + part, lse, mask=row_ok)
+        task += tl.num_programs(0)
 
 
 def attend(
@@ -173,12 +181,14 @@ def attend(
     max_tasks: int,
     block_m: int,
     block_n: int,
+    num_programs: int | None = None,
     num_warps: int = 4,
     num_stages: int = 2,
 ) -> None:
-    """Launch one program per (task slot up to max_tasks, KV head); see the module docstring."""
+    """Launch min(max_tasks, num_programs) programs per KV head; see the module docstring."""
     task_item, task_row_start, task_tok_start, task_tok_end, task_part_base = tasks
-    _work_item_kernel[(max_tasks, k.shape[2])](
+    grid = max(1, min(max_tasks, num_programs or max_tasks))
+    _work_item_kernel[(grid, k.shape[2])](
         q,
         k,
         v,

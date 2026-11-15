@@ -532,6 +532,7 @@ class VllmTritonDecode:
             q.shape[1],
             k.shape[2],
             q.shape[2],
+            b.block_size,
             torch.device(q.device),
         )
 

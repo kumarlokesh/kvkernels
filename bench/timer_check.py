@@ -13,8 +13,9 @@ clearing L2 are compared, because they leave L2 in different states:
 
 Timers, each reporting a median in microseconds:
 
-    do_bench     the harness timer: zero flush, start event, kernel, end event
-    events_read  the same loop with the read flush
+    do_bench     triton.testing.do_bench: zero flush, start event, kernel, end event
+    events_read  the same loop with the read flush: the harness timer
+                 (bench.harness.read_flush_samples)
     graph_zero   a CUDA graph of [zero flush, kernel] x N minus a graph of
                  [zero flush] x N, divided by N: no launch overhead
     graph_read   the same with the read flush
@@ -157,43 +158,17 @@ def _zero_flush() -> Callable[[], None]:
     return flush
 
 
-def _read_flush() -> Callable[[], None]:
-    import torch
-    from triton import runtime
-
-    cache = runtime.driver.active.get_empty_cache_for_benchmark()
-    total = torch.empty((), dtype=torch.int64, device=cache.device)
-
-    def flush() -> None:
-        torch.sum(cache, dim=0, dtype=torch.int64, out=total)
-
-    return flush
-
-
 def do_bench_us(fn: Callable[[], None]) -> float:
     from bench.harness import do_bench_samples, summarize, timed_samples
 
     return summarize(timed_samples(fn, do_bench_samples)).median_ms * 1e3
 
 
-def events_us(fn: Callable[[], None], flush: Callable[[], None]) -> float:
-    """do_bench's loop with another flush: flush, start event, fn, end event."""
-    import torch
+def events_us(fn: Callable[[], None]) -> float:
+    """The harness timer (bench.harness.read_flush_samples)."""
+    from bench.harness import read_flush_samples, summarize, timed_samples
 
-    fn()
-    flush()
-    torch.cuda.synchronize()
-    event = torch.cuda.Event
-    starts = [event(enable_timing=True) for _ in range(EVENT_SAMPLES)]  # type: ignore[no-untyped-call]
-    ends = [event(enable_timing=True) for _ in range(EVENT_SAMPLES)]  # type: ignore[no-untyped-call]
-    for start, end in zip(starts, ends, strict=True):
-        flush()
-        start.record()
-        fn()
-        end.record()
-    torch.cuda.synchronize()
-    times = [float(s.elapsed_time(e)) for s, e in zip(starts, ends, strict=True)]
-    return statistics.median(times) * 1e3
+    return summarize(timed_samples(fn, read_flush_samples)).median_ms * 1e3
 
 
 def graph_us(fn: Callable[[], None], flush: Callable[[], None]) -> float:
@@ -230,10 +205,12 @@ def graph_us(fn: Callable[[], None], flush: Callable[[], None]) -> float:
 
 
 def all_timers_us(fn: Callable[[], None]) -> dict[str, float]:
-    zero, read = _zero_flush(), _read_flush()
+    from bench.harness import read_flush
+
+    zero, read = _zero_flush(), read_flush()
     return {
         "do_bench": do_bench_us(fn),
-        "events_read": events_us(fn, read),
+        "events_read": events_us(fn),
         "graph_zero": graph_us(fn, zero),
         "graph_read": graph_us(fn, read),
     }

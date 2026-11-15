@@ -6,7 +6,8 @@ them. This adapter builds the per-step inputs the way vLLM's Triton backend does
 for a decode batch (vllm/v1/attention/backends/triton_attn.py at the same
 commit):
 
-    block table      [requests, most KV blocks of any request], int32; unused entries 0
+    block table      [requests, KV blocks of the longest request rounded up to whole
+                     128-token tiles], int32; unused entries 0
     sequence lengths [requests], int32: each request's prefix and suffix tokens
     query starts     0, 1, …, requests: one query token per request
     scratch          per-segment output, maximum and sum for the split-softmax path
@@ -17,6 +18,17 @@ dimension) and reduces them in a second launch; with more it runs one program
 per (request, KV head). The constants are vLLM's MIN_LAUNCH_GRID_SIZE_2D and
 NUM_PAR_SOFTMAX_SEGMENTS. vLLM moves the threshold to the nearest CUDA graph
 capture size when graphs are on; for 8 KV heads that is 16 either way.
+
+The kernel loads the block-table entries of a whole tile of tokens without a
+mask, including entries past the end of a request. In vLLM the table is as wide
+as the model's maximum length, so these loads stay inside it. A table exactly as
+wide as the longest request let the last request's loads run past the end of the
+tensor: at 128 requests of 48 tokens, with 16-token KV blocks and 32-token
+tiles, the second tile reads entry 3 of a 3-entry row, and for the last row that
+entry lies outside the table. One full cascade run on an L4 stopped in this
+case with an illegal memory access; that this load caused it is inference, since
+the case passed when run alone. The table is padded to whole tiles of
+LARGEST_TILE tokens, the largest tile the kernel uses, so no load leaves it.
 """
 
 from __future__ import annotations
@@ -31,6 +43,7 @@ from bench.baselines.vllm import stand_ins
 
 MIN_LAUNCH_GRID_SIZE_2D = 128
 NUM_PAR_SOFTMAX_SEGMENTS = 16
+LARGEST_TILE = 128
 
 
 @dataclass(frozen=True)
@@ -55,11 +68,16 @@ def plan_decode(
     num_q_heads: int,
     num_kv_heads: int,
     head_dim: int,
+    block_size: int,
     device: torch.device,
 ) -> DecodeStep:
     """The step's inputs for requests whose tokens live in block_lists, in order."""
     requests = len(block_lists)
-    width = max((len(b) for b in block_lists), default=1) or 1
+    longest = max(seq_lens, default=0)
+    tiles = max(1, -(-longest // LARGEST_TILE))
+    width = max(
+        -(-tiles * LARGEST_TILE // block_size), max((len(b) for b in block_lists), default=1)
+    )
     table = torch.zeros((requests, width), dtype=torch.int32)
     for r, blocks in enumerate(block_lists):
         table[r, : len(blocks)] = torch.tensor(list(blocks), dtype=torch.int32)

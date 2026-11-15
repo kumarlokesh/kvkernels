@@ -120,3 +120,11 @@ def test_tools_come_from_the_venv_of_the_running_python(
     monkeypatch.setattr(sys, "executable", str(tmp_path / "bin" / "python"))
     assert serving.tool("vllm") == str(tmp_path / "bin" / "vllm")
     assert serving.tool("lm_eval") == "lm_eval"  # not installed there: found on PATH
+
+
+def test_the_bench_saves_generated_texts_for_the_agreement_count(tmp_path: Path) -> None:
+    w = serving.WORKLOADS[0]
+    cmd = serving.bench_command(
+        "m", w, concurrency=16, num_prompts=128, result_dir=tmp_path, result_file="r.json"
+    )
+    assert "--save-detailed" in cmd

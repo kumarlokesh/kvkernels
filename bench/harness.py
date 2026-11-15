@@ -25,7 +25,7 @@ import os
 import subprocess
 import sys
 import time
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
@@ -50,7 +50,7 @@ Tensors = dict[str, "torch.Tensor"]
 Impl = Callable[[Tensors], None]
 Timer = Callable[[Callable[[], None]], list[float]]
 
-TIMER_NAME = "do_bench-cold-l2"
+TIMER_NAME = "events-read-flush-cold-l2"
 WARMUP_MS = 25  # covers compilation and autotuning
 REP_MS = 200  # gives at least MIN_SAMPLES for kernels under about 1 ms
 MIN_SAMPLES = 100
@@ -125,10 +125,12 @@ def summarize(times_ms: Sequence[float]) -> Timing:
 
 
 def do_bench_samples(fn: Callable[[], None], rep_ms: int = REP_MS) -> list[float]:
-    """Raw per-sample times in ms from triton.testing.do_bench.
+    """Raw per-sample times in ms from triton.testing.do_bench (zero flush).
 
-    do_bench clears L2 before every sample by zeroing a large buffer, so each
-    sample reads its inputs from HBM, as a kernel does in serving.
+    No longer the harness timer: do_bench clears L2 by writing zeros, which
+    leaves L2 full of modified lines that the timed call then writes back, so
+    it reads a memory-bound kernel high (a 442 us gather as 614 us on an L4).
+    Kept for bench.timer_check, which compares the two.
     """
     from triton.testing import do_bench
 
@@ -136,13 +138,77 @@ def do_bench_samples(fn: Callable[[], None], rep_ms: int = REP_MS) -> list[float
     return times
 
 
+_READ_FLUSH: list[Callable[[], None]] = []  # made once per process
+
+
+def read_flush() -> Callable[[], None]:
+    """Clear L2 by reading (summing) a buffer larger than it.
+
+    L2 is left holding unmodified lines of the buffer, which cost the next call
+    nothing to evict, so the timed call reads its inputs from device memory and
+    pays for no one else's writes.
+    """
+    if not _READ_FLUSH:
+        import torch
+        from triton import runtime
+
+        cache = runtime.driver.active.get_empty_cache_for_benchmark()
+        total = torch.empty((), dtype=torch.int64, device=cache.device)
+
+        def flush() -> None:
+            torch.sum(cache, dim=0, dtype=torch.int64, out=total)
+
+        _READ_FLUSH.append(flush)
+    return _READ_FLUSH[0]
+
+
+def read_flush_samples(fn: Callable[[], None], rep_ms: int = REP_MS) -> list[float]:
+    """The harness timer: raw per-sample times in ms with a cold, clean L2.
+
+    The same loop as triton.testing.do_bench with the read flush in place of
+    its zero flush:
+
+        GPU stream  … │ read 256 MiB │ start │ fn │ end │ read 256 MiB │ start │ fn │ end │ …
+                                     └──────────────────┘ one sample
+
+    The flush keeps the GPU busy while the CPU queues the start event and the
+    call, so a sample holds no launch overhead.
+    """
+    import torch
+
+    flush = read_flush()
+    fn()
+    torch.cuda.synchronize()
+    event = torch.cuda.Event
+    begin, finish = event(enable_timing=True), event(enable_timing=True)  # type: ignore[no-untyped-call]
+    begin.record()
+    for _ in range(5):
+        flush()
+        fn()
+    finish.record()
+    torch.cuda.synchronize()
+    estimate_ms = max(float(begin.elapsed_time(finish)) / 5, 1e-3)
+    for _ in range(max(1, int(WARMUP_MS / estimate_ms))):
+        fn()
+    n = max(1, int(rep_ms / estimate_ms))
+    starts = [event(enable_timing=True) for _ in range(n)]  # type: ignore[no-untyped-call]
+    ends = [event(enable_timing=True) for _ in range(n)]  # type: ignore[no-untyped-call]
+    for start, end in zip(starts, ends, strict=True):
+        flush()
+        start.record()
+        fn()
+        end.record()
+    torch.cuda.synchronize()
+    return [float(a.elapsed_time(b)) for a, b in zip(starts, ends, strict=True)]
+
+
 def timed_samples(fn: Callable[[], None], timer: Timer) -> list[float]:
     """Run the timer; if it returns fewer than MIN_SAMPLES, retry with a longer rep."""
     times = timer(fn)
-    if len(times) >= MIN_SAMPLES or timer is not do_bench_samples:
+    if len(times) >= MIN_SAMPLES or timer not in (read_flush_samples, do_bench_samples):
         return times
     scale = MIN_SAMPLES / max(len(times), 1) * 1.2
-    return do_bench_samples(fn, rep_ms=int(REP_MS * scale) + 1)
+    return timer(fn, rep_ms=int(REP_MS * scale) + 1)
 
 
 def time_with_reruns(fn: Callable[[], None], timer: Timer) -> tuple[Timing, bool]:
@@ -313,7 +379,7 @@ def run_suite(
     git_sha: str,
     flush_bytes: int,
     measured_peak_gbps: float | None,
-    timer: Timer = do_bench_samples,
+    timer: Timer = read_flush_samples,
 ) -> BenchResult:
     if spec is not None and flush_bytes <= 2 * spec.l2_bytes:
         raise RuntimeError(
@@ -405,14 +471,14 @@ def git_sha(repo: Path = Path(".")) -> str:
 
 
 def flush_buffer_bytes() -> int:
-    """Size of the buffer do_bench zeroes before each sample (256 MiB in Triton 3.8.0)."""
+    """Size of the buffer the timer reads before each sample (Triton's 256 MiB benchmark buffer)."""
     from triton import runtime
 
     cache = runtime.driver.active.get_empty_cache_for_benchmark()
     return int(cache.numel() * cache.element_size())
 
 
-def measure_copy_peak(timer: Timer = do_bench_samples) -> float:
+def measure_copy_peak(timer: Timer = read_flush_samples) -> float:
     """Measured peak bandwidth in GB/s: a 1 GiB device copy, one read and one write."""
     from bench.suites.smoke import PROBE_BYTES, copy_case
 
@@ -437,9 +503,16 @@ def suite_module(suite: str) -> str:
     return f"bench.suites.{suite}"
 
 
-def load_cases(suite: str) -> list[Case]:
+def load_cases(suite: str) -> Iterator[Case]:
+    """The suite's cases, made one at a time.
+
+    Never collect them in a list: an implementation keeps the GPU memory its
+    plan allocated (a FlashInfer workspace is 128 MiB), so a list of every case
+    holds every case's memory until the suite ends. On a 24 GB GPU the cascade
+    suite ran out of memory a third of the way through that way.
+    """
     module = importlib.import_module(suite_module(suite))
-    return list(module.cases())
+    yield from module.cases()
 
 
 def parse_filters(items: Sequence[str]) -> dict[str, str]:
@@ -479,22 +552,20 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 2
 
     filters = parse_filters(args.filter)
-    cases = [c for c in load_cases(args.suite) if matches(c.params, filters)]
-    if not cases:
-        print("harness: no cases match", file=sys.stderr)
-        return 2
-
     peak = measure_copy_peak()
     print(f"measured copy peak: {peak:.1f} GB/s", flush=True)
     result = run_suite(
         args.suite,
-        cases,
+        (c for c in load_cases(args.suite) if matches(c.params, filters)),
         lookup(info.gpu_name),
         env=info,
         git_sha=git_sha(),
         flush_bytes=flush_buffer_bytes(),
         measured_peak_gbps=peak,
     )
+    if not result.measurements and not result.left_out:
+        print("harness: no cases match", file=sys.stderr)
+        return 2
     path = write_result(result, args.out)
     print(f"wrote {path}")
     return 0

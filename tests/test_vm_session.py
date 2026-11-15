@@ -27,7 +27,7 @@ def test_without_iap_ssh_goes_straight_to_port_22() -> None:
 
 def test_a_run_outlives_the_ssh_connection_and_logs_next_to_its_results() -> None:
     command = vm_session.run_command("20260101T000000Z", "env,test-gpu", "abc123")
-    assert "setsid nohup" in command
+    assert "(setsid nohup" in command and "< /dev/null &)" in command
     assert "--out ~/sessions/20260101T000000Z" in command
     assert "> ~/sessions/20260101T000000Z.log" in command
     assert "--steps env,test-gpu" in command

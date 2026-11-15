@@ -210,6 +210,7 @@ def bench_command(
         "--metric-percentiles",
         "50,99",
         "--save-result",
+        "--save-detailed",  # keeps generated_texts, which the agreement count compares
         "--result-dir",
         str(result_dir),
         "--result-filename",

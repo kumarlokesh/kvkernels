@@ -24,8 +24,18 @@ passed on the released source, with the torch and Triton versions of that run.
   host sync, so planning and attention capture in one CUDA graph.
 - `CascadePlan(batch_invariant=True)`: no groups and split-K by each request's
   length alone, so a request's output does not depend on its batch.
+- Planning from a block table or slot list replays its four launches from a CUDA
+  graph the plan records on the second call with the same tensors, so a step's
+  planning costs one graph launch of CPU time.
 - `kvkernels.layouts`: the KV cache layouts of vLLM 0.32.0 and SGLang 0.5.22,
   and the views the ops take of them.
 - `kvkernels.reference`: PyTorch references for every op.
 - Support for torch 2.13 and later and Triton 3.7 and later, on Python 3.11 and
   later.
+
+### Changed
+
+- The cascade's attention and merge kernels launch a fixed number of programs
+  that loop over the batch's work, instead of one program per slot of the
+  plan's capacity. Under a CUDA graph sized for 256 requests this removes about
+  0.27 ms per layer at batch 16 on an L4.

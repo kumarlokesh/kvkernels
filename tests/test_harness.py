@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import dataclasses
+import gc
 import time
+import weakref
 from collections.abc import Callable, Iterator
 
 import pytest
@@ -151,6 +153,41 @@ def test_a_case_out_of_gpu_memory_is_left_out_and_the_suite_goes_on() -> None:
     )
 
 
+def test_a_finished_case_is_released_before_the_next_one_runs() -> None:
+    # A case keeps whatever its implementations' plans allocated; holding finished
+    # cases would hold that GPU memory until the suite ends.
+    refs: list[weakref.ref[Case]] = []
+    released: list[bool] = []
+
+    def good(t: Tensors) -> None:
+        t["dst"].copy_(t["src"])
+
+    def check_first_is_gone(t: Tensors) -> None:
+        gc.collect()
+        released.append(refs[0]() is None)
+        good(t)
+
+    def remember(case: Case) -> Case:
+        refs.append(weakref.ref(case))
+        return case
+
+    def cases() -> Iterator[Case]:
+        yield remember(copy_case())
+        yield copy_case({"ref": check_first_is_gone, "other": good})
+
+    harness.run_suite(
+        "t",
+        cases(),
+        None,
+        env=ENV,
+        git_sha="x",
+        flush_bytes=1,
+        measured_peak_gbps=None,
+        timer=fixed_timer(*([[1.0] * 100] * 4)),
+    )
+    assert released and all(released)
+
+
 def test_git_sha_comes_from_the_environment_when_set(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("KVKERNELS_GIT_SHA", "dirty-0123abc")
     assert harness.git_sha() == "dirty-0123abc"
@@ -214,7 +251,7 @@ def test_run_suite_builds_one_measurement_per_impl() -> None:
     )
     assert [m.impl for m in result.measurements] == ["ref", "other"]
     assert [m.median_ms for m in result.measurements] == [1.0, 2.0]
-    assert result.timer == "do_bench-cold-l2"
+    assert result.timer == "events-read-flush-cold-l2"
 
 
 def test_a_plan_runs_before_its_implementation_and_is_timed_on_its_own() -> None:
@@ -268,19 +305,21 @@ def test_filters() -> None:
 
 
 def test_smoke_suite_is_discoverable() -> None:
-    cases = harness.load_cases("smoke")
+    loaded = harness.load_cases("smoke")
+    assert isinstance(loaded, Iterator) and not isinstance(loaded, list)  # one case at a time
+    cases = list(loaded)
     assert [c.params["bytes"] for c in cases][-1] == 1 << 30
 
 
 @pytest.mark.gpu
-def test_do_bench_returns_enough_samples_on_gpu() -> None:
+def test_the_timer_returns_enough_samples_on_gpu() -> None:
     x = torch.empty(1 << 20, dtype=torch.uint8, device="cuda")
     y = torch.empty_like(x)
 
     def copy() -> None:
         y.copy_(x)
 
-    times = harness.timed_samples(copy, harness.do_bench_samples)
+    times = harness.timed_samples(copy, harness.read_flush_samples)
     assert len(times) >= harness.MIN_SAMPLES
 
 

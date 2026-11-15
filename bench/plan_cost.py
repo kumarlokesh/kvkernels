@@ -27,7 +27,7 @@ from dataclasses import dataclass
 
 import torch
 
-from bench.harness import Tensors, do_bench_samples, host_us_per_call, summarize
+from bench.harness import Tensors, host_us_per_call, read_flush_samples, summarize
 from kvkernels.layouts import LAYOUTS, CacheSpec, kv_views, make_cache
 from kvkernels.ops.cascade import CascadePlan, PrefixGroup, cascade_decode_attention
 from kvkernels.ops.cascade_plan import planning_launches
@@ -115,16 +115,16 @@ def measure_batch(batch: int, *, calls: int = CALLS, device: str = "cuda") -> Ro
     gpu_plan()  # sets the batch size the launches read
     launches_us = host_us_per_call(_as_impl(launch_all), {}, calls)
     gpu_cpu_us = host_us_per_call(_as_impl(gpu_plan), {}, calls)
-    gpu_us = summarize(do_bench_samples(gpu_plan)).median_ms * 1000
+    gpu_us = summarize(read_flush_samples(gpu_plan)).median_ms * 1000
     kernel_us = {
-        name: summarize(do_bench_samples(launch)).median_ms * 1000 for name, launch in launches
+        name: summarize(read_flush_samples(launch)).median_ms * 1000 for name, launch in launches
     }
     step()  # compile every kernel before capture
     torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         step()
-    graph_us = summarize(do_bench_samples(graph.replay)).median_ms * 1000
+    graph_us = summarize(read_flush_samples(graph.replay)).median_ms * 1000
     return Row(batch, host_us, launches_us, gpu_cpu_us, gpu_us, graph_us, kernel_us)
 
 

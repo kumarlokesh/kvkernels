@@ -184,33 +184,35 @@ def _merge_ragged_kernel(  # type: ignore[no-untyped-def]
     """Row r = token · heads + head merges parts indices[start[r] : end[r]].
 
     Parts are rows of part_o ([parts, head_dim], fp32) and part_lse ([parts]).
-    The grid may be larger than the batch; rows at or past num_rows exit.
+    Program p merges rows p, p + programs, p + 2 · programs, … below num_rows, so
+    the grid does not grow with the largest batch a CUDA graph must serve.
     """
-    row = tl.program_id(0)
-    if row >= tl.load(num_rows_ptr):
-        return
-    t = row // heads
-    h = row % heads
+    num_rows = tl.load(num_rows_ptr)
     d = tl.arange(0, BLOCK_D)
     d_ok = d < head_dim
-    m = tl.full((BLOCK_D,), float("-inf"), dtype=tl.float32)
-    s = tl.zeros((BLOCK_D,), dtype=tl.float32)
-    acc = tl.zeros((BLOCK_D,), dtype=tl.float32)
-    first = tl.load(start_ptr + row)
-    last = tl.load(end_ptr + row)
-    for i in range(first, last):
-        part = tl.load(indices_ptr + i).to(tl.int64)
-        part_lse = tl.load(part_lse_ptr + part)
-        part_o = tl.load(part_o_ptr + part * head_dim + d, mask=d_ok, other=0.0)
-        m, s, acc = _merge_step(m, s, acc, part_lse, part_o)
-    out, lse = _finish(m, s, acc)
-    tl.store(
-        out_ptr + t * stride_out_t + h * stride_out_h + d * stride_out_d,
-        out.to(out_ptr.dtype.element_ty),
-        mask=d_ok,
-    )
-    if WRITE_LSE:
-        tl.store(lse_out_ptr + t * stride_lo_t + h * stride_lo_h + d * 0, lse, mask=d == 0)
+    row = tl.program_id(0)
+    while row < num_rows:
+        t = row // heads
+        h = row % heads
+        m = tl.full((BLOCK_D,), float("-inf"), dtype=tl.float32)
+        s = tl.zeros((BLOCK_D,), dtype=tl.float32)
+        acc = tl.zeros((BLOCK_D,), dtype=tl.float32)
+        first = tl.load(start_ptr + row)
+        last = tl.load(end_ptr + row)
+        for i in range(first, last):
+            part = tl.load(indices_ptr + i).to(tl.int64)
+            part_lse = tl.load(part_lse_ptr + part)
+            part_o = tl.load(part_o_ptr + part * head_dim + d, mask=d_ok, other=0.0)
+            m, s, acc = _merge_step(m, s, acc, part_lse, part_o)
+        out, lse = _finish(m, s, acc)
+        tl.store(
+            out_ptr + t * stride_out_t + h * stride_out_h + d * stride_out_d,
+            out.to(out_ptr.dtype.element_ty),
+            mask=d_ok,
+        )
+        if WRITE_LSE:
+            tl.store(lse_out_ptr + t * stride_lo_t + h * stride_lo_h + d * 0, lse, mask=d == 0)
+        row += tl.num_programs(0)
 
 
 def _interpreting() -> bool:
@@ -378,16 +380,19 @@ def merge_ragged(
     lse_out: torch.Tensor | None,
     *,
     max_rows: int,
+    num_programs: int | None = None,
 ) -> None:
     """Row r of out ([tokens, heads, head_dim]) merges parts indices[start[r] : end[r]].
 
     part_o: [parts, head_dim] fp32; part_lse: [parts] fp32. num_rows: a one-element
-    device tensor holding tokens · heads; the grid is max_rows programs, so a CUDA
-    graph captured once serves any batch up to max_rows rows.
+    device tensor holding tokens · heads, at most max_rows. The grid is
+    min(max_rows, num_programs) programs, each looping over rows, so a CUDA graph
+    captured once serves any batch up to max_rows rows.
     """
     heads, head_dim = out.shape[1], out.shape[2]
     lse_target, lo_t, lo_h = _lse_args(lse_out, out)
-    _merge_ragged_kernel[(max_rows,)](
+    grid = max(1, min(max_rows, num_programs or max_rows))
+    _merge_ragged_kernel[(grid,)](
         part_o,
         part_lse,
         start,
