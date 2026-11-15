@@ -1,9 +1,11 @@
 """Pure-PyTorch references for decode attention over a paged cache, and for merging.
 
-Decode: one query token per request. A request's keys are its shared prefix's
-tokens followed by its own suffix's tokens, each a list of KV blocks and a
-length. K and V are the per-layer views of kvkernels.layouts: [blocks, slots,
-kv_heads, head_dim]. Query head h reads KV head h // group.
+Decode: one or more query tokens per request. A request's keys are its shared
+prefix's tokens followed by its own suffix's tokens, each a list of KV blocks
+and a length. With T query tokens per request, q holds rows r · T … r · T + T - 1
+for request r, oldest first, and token t sees the first length - T + t + 1 keys.
+K and V are the per-layer views of kvkernels.layouts: [blocks, slots, kv_heads,
+head_dim]. Query head h reads KV head h // group.
 
     attention_ref32     the answer to compare against: fp64 arithmetic, returned as fp32
     attention_ref_low   out from PyTorch's SDPA in the input dtype; lse from scores
@@ -71,27 +73,32 @@ def attention_ref32(
     v: torch.Tensor,
     requests: Sequence[RequestKV],
     sm_scale: float | None = None,
+    query_tokens: int = 1,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """(out, lse) per request and query head, computed in fp64 and returned as fp32.
+    """(out, lse) per query row and head, computed in fp64 and returned as fp32.
 
-    q: [requests, q_heads, head_dim]. out: like q in fp32; lse: [requests, q_heads].
+    q: [requests · query_tokens, q_heads, head_dim]. out: like q in fp32; lse:
+    [requests · query_tokens, q_heads].
     """
-    num_req, q_heads, head_dim = q.shape
+    rows, q_heads, head_dim = q.shape
     group = q_heads // k.shape[2]
     scale = _scale(head_dim, sm_scale)
-    out = torch.zeros((num_req, q_heads, head_dim), dtype=torch.float32, device=q.device)
-    lse = torch.full((num_req, q_heads), float("-inf"), dtype=torch.float32, device=q.device)
+    out = torch.zeros((rows, q_heads, head_dim), dtype=torch.float32, device=q.device)
+    lse = torch.full((rows, q_heads), float("-inf"), dtype=torch.float32, device=q.device)
     for r, req in enumerate(requests):
         keys, values = request_kv(k, v, req)
-        if keys.shape[0] == 0:
-            continue
         kd = keys.double().repeat_interleave(group, dim=1)  # [tokens, q_heads, d]
         vd = values.double().repeat_interleave(group, dim=1)
-        scores = torch.einsum("hd,thd->ht", q[r].double(), kd) * scale
-        row_lse = torch.logsumexp(scores, dim=-1)
-        probs = torch.exp(scores - row_lse[:, None])
-        out[r] = torch.einsum("ht,thd->hd", probs, vd).float()
-        lse[r] = row_lse.float()
+        for t in range(query_tokens):
+            seen = keys.shape[0] - query_tokens + t + 1
+            row = r * query_tokens + t
+            if seen <= 0:
+                continue
+            scores = torch.einsum("hd,thd->ht", q[row].double(), kd[:seen]) * scale
+            row_lse = torch.logsumexp(scores, dim=-1)
+            probs = torch.exp(scores - row_lse[:, None])
+            out[row] = torch.einsum("ht,thd->hd", probs, vd[:seen]).float()
+            lse[row] = row_lse.float()
     return out, lse
 
 
@@ -101,26 +108,30 @@ def attention_ref_low(
     v: torch.Tensor,
     requests: Sequence[RequestKV],
     sm_scale: float | None = None,
+    query_tokens: int = 1,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """(out in q's dtype from SDPA, lse in fp32 from scores rounded to q's dtype)."""
-    num_req, q_heads, head_dim = q.shape
+    rows, q_heads, head_dim = q.shape
     group = q_heads // k.shape[2]
     scale = _scale(head_dim, sm_scale)
     out = torch.zeros_like(q)
-    lse = torch.full((num_req, q_heads), float("-inf"), dtype=torch.float32, device=q.device)
+    lse = torch.full((rows, q_heads), float("-inf"), dtype=torch.float32, device=q.device)
     for r, req in enumerate(requests):
         keys, values = request_kv(k, v, req)
-        if keys.shape[0] == 0:
-            continue
-        kt = keys.transpose(0, 1)[None]  # [1, kv_heads, tokens, d]
-        vt = values.transpose(0, 1)[None]
-        qr = q[r][None, :, None, :]  # [1, q_heads, 1, d]
-        out[r] = F.scaled_dot_product_attention(qr, kt, vt, scale=scale, enable_gqa=group > 1)[
-            0, :, 0
-        ]
-        kr = keys.repeat_interleave(group, dim=1)
-        scores = torch.einsum("hd,thd->ht", q[r], kr).float() * scale
-        lse[r] = torch.logsumexp(scores, dim=-1)
+        for t in range(query_tokens):
+            seen = keys.shape[0] - query_tokens + t + 1
+            row = r * query_tokens + t
+            if seen <= 0:
+                continue
+            kt = keys[:seen].transpose(0, 1)[None]  # [1, kv_heads, tokens, d]
+            vt = values[:seen].transpose(0, 1)[None]
+            qr = q[row][None, :, None, :]  # [1, q_heads, 1, d]
+            out[row] = F.scaled_dot_product_attention(
+                qr, kt, vt, scale=scale, enable_gqa=group > 1
+            )[0, :, 0]
+            kr = keys[:seen].repeat_interleave(group, dim=1)
+            scores = torch.einsum("hd,thd->ht", q[row], kr).float() * scale
+            lse[row] = torch.logsumexp(scores, dim=-1)
     return out, lse
 
 

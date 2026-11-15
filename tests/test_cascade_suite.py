@@ -52,7 +52,8 @@ def test_grid_covers_the_planned_cases() -> None:
     params = list(suite.grid())
     main = 2 * 6 * 4 * 4  # models, batches, prefixes, suffixes
     extra = 4 * 4 * 4  # per (prefix, suffix): groups, GQA 1, GQA 8, SGLang layout
-    threshold = 2 * len(suite.THRESHOLD_PREFIXES)  # batch 2 and 8
+    # Batch 16 with a 512-token prefix is already in the main grid.
+    threshold = len(suite.THRESHOLD_BATCHES) * len(suite.THRESHOLD_PREFIXES) - 1
     assert len(params) == main + extra + 1 + threshold  # and one bf16 shape
     assert len({tuple(sorted(p.items())) for p in params}) == len(params)
     for p in params:
@@ -108,7 +109,7 @@ def test_threshold_settings_run_only_on_the_threshold_cases() -> None:
         suite._params(batch=2, prefix=64, suffix=512), with_flashinfer=False
     )
     main = suite.implementations(
-        suite._params(batch=2, prefix=512, suffix=512), with_flashinfer=False
+        suite._params(batch=4, prefix=512, suffix=512), with_flashinfer=False
     )
     assert {"kvkernels_gpu_grouped", "kvkernels_gpu_ungrouped"} <= set(sweep)
     assert "kvkernels_gpu_grouped" not in main

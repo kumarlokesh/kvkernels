@@ -8,14 +8,17 @@ block table row has 512 entries. One row per batch size:
 
     host plan          CPU time of the host plan: groups named by the caller,
                        buffers built in Python and copied to the GPU
-    launches, CPU      CPU time of the four planning kernels launched directly
+    launches, CPU      CPU time of the three planning kernels launched directly
     GPU plan, CPU      CPU time of planning from the block table, called eagerly;
                        after the second call the plan replays its own graph
     GPU plan, GPU      GPU time of planning from the block table
     step in a graph    GPU time of one replay of planning plus one layer's
                        attention, captured together in one CUDA graph
 
-A second table gives each planning kernel's GPU time, from a cold L2.
+A second table gives each planning kernel's GPU time, from a cold L2. A third
+gives the GPU time of planning a three-level tree at batch 256 (a 1,024-token
+system prompt, 4 tool lists of 1,024 tokens, 16 histories of 2,048, then 4,096
+tokens per request: 512 entries per row) with 1 to 4 rounds of tree finding.
 
 The batch sizes run to 256, the largest batch the planning targets name.
 """
@@ -132,6 +135,48 @@ def measure(batches: tuple[int, ...] = BATCHES, calls: int = CALLS) -> list[Row]
     return [measure_batch(b, calls=calls) for b in batches]
 
 
+TREE_LEVELS = ((1, 64), (4, 64), (16, 128))  # (nodes, KV blocks per node), outermost first
+
+
+def measure_levels(
+    batch: int = 256, levels: tuple[int, ...] = (1, 2, 3, 4), device: str = "cuda"
+) -> dict[int, float]:
+    """GPU time of planning a three-level tree with each max_levels."""
+    gen = torch.Generator().manual_seed(0)
+    num_blocks = 1 + sum(n * b for n, b in TREE_LEVELS) + batch * OWN_BLOCKS
+    ids = (torch.randperm(num_blocks - 1, generator=gen) + 1).tolist()
+    taken = 0
+    columns = []
+    for nodes, blocks in TREE_LEVELS:
+        spans = [ids[taken + j * blocks : taken + (j + 1) * blocks] for j in range(nodes)]
+        taken += nodes * blocks
+        columns.append(torch.tensor([spans[r * nodes // batch] for r in range(batch)]))
+    columns.append(torch.tensor(ids[taken:]).view(batch, OWN_BLOCKS))
+    table = torch.cat(columns, dim=1).to(torch.int32).to(device)
+    lens = torch.full((batch,), table.shape[1] * BLOCK_SIZE, dtype=torch.int32, device=device)
+    out = {}
+    for max_levels in levels:
+        plan = CascadePlan(
+            max_requests=batch,
+            max_groups=batch,
+            max_blocks=1,
+            num_q_heads=Q_HEADS,
+            num_kv_heads=KV_HEADS,
+            head_dim=HEAD_DIM,
+            block_size=BLOCK_SIZE,
+            num_blocks=num_blocks,
+            device=torch.device(device),
+            max_levels=max_levels,
+        )
+
+        def gpu_plan(plan: CascadePlan = plan) -> None:
+            plan.plan_from_block_table(table, lens)
+
+        gpu_plan()
+        out[max_levels] = summarize(read_flush_samples(gpu_plan)).median_ms * 1000
+    return out
+
+
 def main() -> int:
     if not torch.cuda.is_available():
         raise SystemExit("needs a CUDA GPU")
@@ -149,6 +194,9 @@ def main() -> int:
     print(f"{'batch':>6} " + " ".join(f"{n:>10}" for n in names))
     for r in rows:
         print(f"{r.batch:>6} " + " ".join(f"{r.kernel_us[n]:>8.1f}us" for n in names))
+    print("\nGPU time of planning a three-level tree, batch 256, by max_levels")
+    for levels, us in measure_levels().items():
+        print(f"{levels:>6} {us:>8.1f}us")
     return 0
 
 

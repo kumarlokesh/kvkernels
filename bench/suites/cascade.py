@@ -79,7 +79,9 @@ PREFIXES = (512, 2048, 8192, 32768)
 SUFFIXES = (0, 128, 512, 2048)
 BLOCK_SIZE = 16
 DEFAULT_LAYOUT = "vllm_LBNHC"
-THRESHOLD_PREFIXES = (16, 32, 64, 128, 256)
+# Shared lengths and batches timed with every run grouped and with none, 512-token suffixes.
+THRESHOLD_PREFIXES = (64, 128, 256, 384, 512, 768, 1024)
+THRESHOLD_BATCHES = (2, 8, 16)
 NEVER_GROUP = 1 << 30
 # The split-K settings timed at batch 1 and 4: (minimum range length, programs per SM).
 SPLIT_SETTINGS = {
@@ -132,13 +134,19 @@ def grid() -> Iterator[Params]:
                 yield _params(batch=32, prefix=prefix, suffix=suffix, kv_heads=kv_heads)
             yield _params(batch=32, prefix=prefix, suffix=suffix, layout="sglang_nhd", block=1)
     yield _params(batch=32, prefix=8192, suffix=512, dtype="bfloat16")
-    for batch in (2, 8):
+    for batch in THRESHOLD_BATCHES:
         for prefix in THRESHOLD_PREFIXES:
-            yield _params(batch=batch, prefix=prefix, suffix=512)
+            if batch not in BATCHES or prefix not in PREFIXES:  # else the main grid has it
+                yield _params(batch=batch, prefix=prefix, suffix=512)
 
 
 def is_threshold_sweep(p: Params) -> bool:
-    return int(p["prefix_len"]) in THRESHOLD_PREFIXES and int(p["batch"]) in (2, 8)
+    return (
+        int(p["prefix_len"]) in THRESHOLD_PREFIXES
+        and int(p["batch"]) in THRESHOLD_BATCHES
+        and int(p["suffix_len"]) == 512
+        and p == _params(batch=int(p["batch"]), prefix=int(p["prefix_len"]), suffix=512)
+    )
 
 
 def is_split_sweep(p: Params) -> bool:
@@ -374,7 +382,7 @@ class Kvkernels:
 class KvkernelsGpuPlan:
     """Plans every step on the GPU from the index, inside the timed call."""
 
-    def __init__(self, *, layout: str, min_shared_tokens: int = 64) -> None:
+    def __init__(self, *, layout: str, min_shared_tokens: int | None = None) -> None:
         self.layout = layout
         self.min_shared_tokens = min_shared_tokens
         self.cascade: CascadePlan | None = None

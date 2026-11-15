@@ -168,13 +168,16 @@ def test_planes_of_the_all_layer_orders_step_over_every_layer() -> None:
     assert plane.stride(0) == SPEC.num_layers * block_values
 
 
-def test_fp8_caches_give_planes_but_not_kv_views() -> None:
+def test_fp8_caches_give_planes_and_kv_views_but_not_other_8_bit_types() -> None:
     spec = CacheSpec(2, 3, 4, 2, 8, torch.float8_e4m3fn)
     layout = LAYOUTS["vllm_LBNHC"]
     layer = make_cache(layout, spec)[0]
     assert planes(layout, spec, layer)[0].dtype == torch.float8_e4m3fn
+    k, v = kv_views(layout, spec, layer)
+    assert k.dtype == v.dtype == torch.float8_e4m3fn and tuple(k.shape) == (3, 4, 2, 8)
+    e5m2 = CacheSpec(2, 3, 4, 2, 8, torch.float8_e5m2)
     with pytest.raises(ValueError, match="views"):
-        kv_views(layout, spec, layer)
+        kv_views(layout, e5m2, make_cache(layout, e5m2)[0])
 
 
 # --- the index ---------------------------------------------------------------------

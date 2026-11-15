@@ -78,3 +78,7 @@ passed on the released source, with the torch and Triton versions of that run.
   suite (geometric mean of 267 cases), 0.83x at best and 1.14x at worst
   (batch 128, 2,048-token prefix, 128-token suffixes); batch 1 with a
   512-token prefix takes 21.5 us per layer.
+- Requests are grouped only when they share at least 512 tokens
+  (`min_shared_tokens`, 64 before). On an L4, groups sharing 16-256 tokens
+  took 0.98-1.07x the time of reading those tokens with each request; from 512
+  tokens they took 0.61-1.03x.

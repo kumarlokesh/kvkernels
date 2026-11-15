@@ -80,7 +80,7 @@ def new_plan(
     block_size: int,
     device: torch.device,
     batch_invariant: bool = False,
-    min_shared_tokens: int = 64,
+    min_shared_tokens: int | None = None,
 ) -> CascadePlan:
     """A plan sized for vLLM's maximum number of sequences, filled each step on the GPU."""
     if max_requests > MAX_PLAN_REQUESTS:

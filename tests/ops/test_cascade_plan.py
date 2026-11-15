@@ -145,6 +145,7 @@ def new_plan(setup: Setup, batch: Batch, **kwargs: int | bool) -> CascadePlan:
         "block_size": batch.block_size,
         "num_blocks": batch.num_blocks,
         "min_shared_tokens": batch.block_size,
+        "max_levels": 1,  # these tests check one level of groups; test_tree_attention the rest
     }
     args.update(kwargs)
     return CascadePlan(device=torch.device(DEVICE), **args)  # type: ignore[arg-type]

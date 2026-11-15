@@ -45,8 +45,9 @@ SGLANG_COMMIT = "baa9befa381511cd4d56f83980951e5a45fffc6d"  # v0.5.22
 
 RESERVED_BLOCK = 0
 
-# fp8 caches are supported for planes only: copying bytes needs no K/V split.
-_VIEW_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
+# K and V views: an fp8 cache is viewed as float8_e4m3fn (engines store its
+# bytes as uint8; view the cache as float8_e4m3fn first).
+_VIEW_DTYPES = (torch.float16, torch.bfloat16, torch.float32, torch.float8_e4m3fn)
 
 
 @dataclass(frozen=True)

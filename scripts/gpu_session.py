@@ -112,6 +112,8 @@ STEPS = (
         needs=EXPERIMENT_TESTS,
     ),
     Step("cascade", _suite("cascade"), writes_results=True, needs=RESULT_TESTS),
+    Step("cascade_tree", _suite("cascade_tree"), writes_results=True, needs=RESULT_TESTS),
+    Step("cascade_fp8", _suite("cascade_fp8"), writes_results=True, needs=RESULT_TESTS),
     Step("dram", "uv run python -m bench.dram_bytes", writes_results=True, needs=RESULT_TESTS),
     Step("plan-cost", "uv run python -m bench.plan_cost"),
     Step(

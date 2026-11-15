@@ -159,9 +159,12 @@ def test_a_mixed_batch_through_the_builder_and_forward(monkeypatch: pytest.Monke
     from vllm.v1.attention.backends.triton_attn import TritonAttentionImpl
     from vllm.v1.kv_cache_interface import KVQuantMode
 
+    import kvkernels.ops.cascade
     from kvkernels.layouts import LAYOUTS, CacheSpec, make_cache
     from kvkernels_vllm.backend import KvkernelsAttentionImpl, KvkernelsMetadataBuilder
 
+    # The batch is small; group its 64 shared tokens despite the 512-token default.
+    monkeypatch.setattr(kvkernels.ops.cascade, "MIN_SHARED_TOKENS", 64)
     device = "cuda" if torch.cuda.is_available() else "cpu"
     gen = torch.Generator().manual_seed(0)
     block = 16
