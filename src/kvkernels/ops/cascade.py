@@ -26,12 +26,24 @@ Requests are read through a permutation, so a group's requests need not be
 consecutive in the batch; out[r] is always request r.
 
 Three launches: prefix tasks, suffix tasks, merge. The two attention launches
-run the same kernel with different row-tile heights: a prefix item has many
-requests' rows, a suffix item only one request's GQA group.
+run the same kernel with different tiles:
 
-Split-K: when the tasks without splitting would give fewer than
-programs_per_sm · SMs programs, each item's tokens are cut into ranges of at
-least min_split_tokens, up to MAX_SPLITS, so small batches still fill the GPU.
+    launch    rows per tile   warps   pipeline stages
+    prefix    128             8       3                 many requests' rows per item
+    suffix     16             4       2                 one request's GQA group per item
+
+On an L4 the prefix tiles of 128 rows and 8 warps took 1.6-1.8x less time than
+64 rows and 4 warps at batch 64 and 128 with prefixes of 8,192 and 32,768
+tokens, 1.2x less at batch 32, and up to 7% more at batch 16, where an item
+has only 64 rows per KV head.
+
+Split-K: when a launch's tasks without splitting would give fewer than
+programs_per_sm · SMs programs, each of its items' tokens are cut into ranges
+of at least min_split_tokens, up to MAX_SPLITS, so small batches still fill the
+GPU. Each launch is counted alone, since the two run one after the other: with
+the suffix programs counted in, a batch of 128 requests left its prefix item
+unsplit, 64 programs on 58 SMs, and the prefix launch took 2.9 ms instead of
+2.0 ms on an L4 (prefix of 32,768 tokens).
 """
 
 from __future__ import annotations
@@ -51,6 +63,9 @@ from kvkernels.ops.prefix_attention import attend
 MAX_SPLITS = 16
 TASK_WAVES = 8  # attention programs per KV head: TASK_WAVES · programs_per_sm · SMs / KV heads
 MERGE_PROGRAMS_PER_SM = 32  # merge programs are small; many fit on one SM
+# Warps and pipeline stages of each attention launch; see the module docstring.
+PREFIX_WARPS, PREFIX_STAGES = 8, 3
+SUFFIX_WARPS, SUFFIX_STAGES = 4, 2
 HEAD_DIMS = (64, 128)
 _IN_DTYPES = (torch.float16, torch.bfloat16)
 
@@ -100,7 +115,7 @@ class CascadePlan:
         num_sms: int | None = None,
         programs_per_sm: int = 2,
         min_split_tokens: int = 512,
-        prefix_block_m: int = 64,
+        prefix_block_m: int = 128,
         suffix_block_m: int = 16,
         block_n: int | None = None,
         min_shared_tokens: int = 64,
@@ -267,7 +282,10 @@ class CascadePlan:
         for r, (blocks, length) in enumerate(zip(suffix_blocks, suffix_lens, strict=True)):
             if length > 0:
                 items.append((r, 1, blocks, length, self.suffix_block_m))
-        base_programs = sum(math.ceil(n * g / bm) * hkv for _, n, _, _, bm in items)
+        # Programs of each launch before splitting; the launches run one after the other.
+        base_programs = {self.prefix_block_m: 0, self.suffix_block_m: 0}
+        for _, n, _, _, bm in items:
+            base_programs[bm] += math.ceil(n * g / bm) * hkv
 
         flat: list[int] = []
         req_start, num_reqs, block_start = [], [], []
@@ -282,7 +300,7 @@ class CascadePlan:
             num_reqs.append(n_req)
             block_start.append(len(flat))
             flat.extend(blocks[: math.ceil(length / self.block_size)])
-            splits = self._splits(length, base_programs)
+            splits = self._splits(length, base_programs[bm])
             span = math.ceil(math.ceil(length / splits) / self.block_n) * self.block_n
             ranges = [(s, min(s + span, length)) for s in range(0, length, span)]
             rows = n_req * g
@@ -469,8 +487,28 @@ def _cascade_op(
         "block_n": block_n,
         "num_programs": task_programs,
     }
-    attend(q, k, v, tasks=prefix_tasks, num_tasks=counts[0:1], block_m=prefix_bm, **common)  # type: ignore[arg-type]
-    attend(q, k, v, tasks=suffix_tasks, num_tasks=counts[1:2], block_m=suffix_bm, **common)  # type: ignore[arg-type]
+    attend(
+        q,
+        k,
+        v,
+        tasks=prefix_tasks,  # type: ignore[arg-type]
+        num_tasks=counts[0:1],
+        block_m=prefix_bm,
+        num_warps=PREFIX_WARPS,
+        num_stages=PREFIX_STAGES,
+        **common,  # type: ignore[arg-type]
+    )
+    attend(
+        q,
+        k,
+        v,
+        tasks=suffix_tasks,  # type: ignore[arg-type]
+        num_tasks=counts[1:2],
+        block_m=suffix_bm,
+        num_warps=SUFFIX_WARPS,
+        num_stages=SUFFIX_STAGES,
+        **common,  # type: ignore[arg-type]
+    )
     merge_ragged(
         part_o,
         part_lse,

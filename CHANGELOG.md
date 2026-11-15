@@ -39,3 +39,12 @@ passed on the released source, with the torch and Triton versions of that run.
   that loop over the batch's work, instead of one program per slot of the
   plan's capacity. Under a CUDA graph sized for 256 requests this removes about
   0.27 ms per layer at batch 16 on an L4.
+- The cascade's prefix tiles are 128 query rows with 8 warps and 3 pipeline
+  stages (64 rows and 4 warps before). On an L4 one layer at batch 64 and 128
+  with a 32,768-token prefix takes 1.5-1.6x less time; batch 16 takes up to 3%
+  more and batch 1 4 us more. `CascadePlan(prefix_block_m=64)` gives 64-row
+  prefix tiles, still with 8 warps.
+- Split-K counts the prefix launch's programs and the suffix launch's programs
+  separately. With both counted together, a batch with many suffixes left its
+  prefix unsplit: batch 128, 32,768-token prefix, 128-token suffixes took
+  3.3 ms per layer on an L4 and now takes 1.8 ms.

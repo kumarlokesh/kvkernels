@@ -268,12 +268,15 @@ def _items_kernel(  # type: ignore[no-untyped-def]
     num_items = num_groups + tl.sum(has_suffix.to(tl.int32), 0)
 
     # Split-K, with a fallback to one range per item when the batch would not fit.
-    base_programs = kv_heads * (tl.sum(group_tiles, 0) + tl.sum(has_suffix.to(tl.int32), 0))
+    # Each launch's programs are counted alone: the prefix and suffix launches
+    # run one after the other.
+    g_base = kv_heads * tl.sum(group_tiles, 0)
+    s_base = kv_heads * tl.sum(has_suffix.to(tl.int32), 0)
     _, g_ranges = _ranges(
-        group_len, base_programs, True, target_programs, min_split, block_n, MAX_SPLITS, INVARIANT
+        group_len, g_base, True, target_programs, min_split, block_n, MAX_SPLITS, INVARIANT
     )
     _, s_ranges = _ranges(
-        suffix_len, base_programs, True, target_programs, min_split, block_n, MAX_SPLITS, INVARIANT
+        suffix_len, s_base, True, target_programs, min_split, block_n, MAX_SPLITS, INVARIANT
     )
     g_parts = group_rows * kv_heads * g_ranges
     s_parts = GROUP * kv_heads * s_ranges
@@ -283,10 +286,10 @@ def _items_kernel(  # type: ignore[no-untyped-def]
         & (tl.sum(s_ranges, 0) <= max_tasks)
     )
     g_span1, g_ranges1 = _ranges(
-        group_len, base_programs, fits, target_programs, min_split, block_n, MAX_SPLITS, INVARIANT
+        group_len, g_base, fits, target_programs, min_split, block_n, MAX_SPLITS, INVARIANT
     )
     s_span1, s_ranges1 = _ranges(
-        suffix_len, base_programs, fits, target_programs, min_split, block_n, MAX_SPLITS, INVARIANT
+        suffix_len, s_base, fits, target_programs, min_split, block_n, MAX_SPLITS, INVARIANT
     )
     g_parts = tl.where(is_group, group_rows * kv_heads * g_ranges1, 0)
     s_parts = GROUP * kv_heads * s_ranges1

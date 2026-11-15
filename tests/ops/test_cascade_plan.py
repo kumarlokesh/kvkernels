@@ -374,6 +374,27 @@ def test_programs_loop_when_the_batch_has_more_work_than_the_grid() -> None:
     check(setup, *attend(setup, plan))
 
 
+def test_the_prefix_is_split_when_suffix_programs_alone_fill_the_gpu() -> None:
+    # 8 requests share 48 KV blocks; 2 prefix programs and 16 suffix programs
+    # against a target of 8. The two launches run one after the other, so the
+    # suffix programs do not fill the GPU while the prefix launch runs.
+    shared = list(range(1, 49))
+    rows = [[*shared, 49 + r] for r in range(8)]
+    batch = explicit_batch(rows, [48 * 4 + 2] * 8, 4)
+    setup = build(batch)
+    plan = new_plan(setup, batch, num_sms=4, programs_per_sm=2, min_split_tokens=4)
+    plan_device(plan, setup)
+    _, groups = found_groups(plan)
+    assert len(groups) == 1 and groups[0].rows == 8
+    assert int(plan.counts[0]) > 1, "the prefix item should have several token ranges"
+    assert int(plan.counts[1]) == 8
+    check(setup, *attend(setup, plan))
+    device_tasks = int(plan.counts[0])
+    host_update(plan, batch, groups)
+    assert int(plan.counts[0]) == device_tasks
+    check(setup, *attend(setup, plan))
+
+
 def test_split_k_falls_back_to_one_range_when_parts_do_not_fit() -> None:
     shared = list(range(1, 13))
     batch = explicit_batch([[*shared, 13], [*shared, 14], list(range(15, 27))], [52, 50, 48], 4)
