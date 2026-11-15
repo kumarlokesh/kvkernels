@@ -186,6 +186,13 @@ def test_rejects_bad_sets() -> None:
         PlaneSet(planes, rows).gather(ids_tensor([0]).long())
 
 
+def test_rejects_more_planes_than_the_grid_axis_holds() -> None:
+    planes = small_planes("vllm_LBNHC")[:1]
+    rows = empty_rows(planes, 1)
+    with pytest.raises(ValueError, match="65535"):
+        PlaneSet(planes * 65_536, rows * 65_536)
+
+
 def test_rejects_rows_that_overlap_a_plane_or_each_other() -> None:
     planes = small_planes("vllm_LBNHC")
     with pytest.raises(ValueError, match="overlaps"):

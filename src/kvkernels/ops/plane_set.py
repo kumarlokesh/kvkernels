@@ -16,7 +16,9 @@ addresses to the GPU. Each call then checks only the ids and makes one launch:
 
 Blocks are copied as raw words, as in gather_kv_blocks; one word width, the
 widest that divides every block size, stride and address of the set, serves
-the whole launch. The set keeps references to its tensors so the addresses in
+the whole launch, so a plane with an odd block size slows every plane in its
+set; such planes go in a set of their own. The set keeps references to its
+tensors so the addresses in
 the table stay valid; a tensor whose storage changes later (resize_, set_) is
 not detected, so build a new set. The first call times the tile sizes; later
 calls allocate nothing and copy nothing from the host, so they can be captured
@@ -49,6 +51,8 @@ from kvkernels.ops.kv_gather import (
 # The plane table's columns: plane address, rows address, plane stride, rows
 # stride, words per block. The kernel reads them in this order.
 _BLOCK_WORDS = 4
+# The plane axis is grid axis 2, which CUDA limits to 65,535 programs.
+_MAX_PLANES = 65_535
 
 
 @triton.jit
@@ -238,6 +242,8 @@ class PlaneSet:
     rows[p]: [capacity, *block_shape_p], contiguous, same dtype as planes[p];
         the same capacity for every p. No row buffer may overlap a plane or
         another row buffer.
+    A scatter into two planes that share a KV block leaves that block undefined,
+    as a repeated id does.
     """
 
     def __init__(self, planes: Sequence[torch.Tensor], rows: Sequence[torch.Tensor]) -> None:
@@ -246,6 +252,8 @@ class PlaneSet:
             raise ValueError(f"got {len(planes)} planes and {len(rows)} row buffers")
         if not planes:
             raise ValueError("need at least one plane")
+        if len(planes) > _MAX_PLANES:
+            raise ValueError(f"{len(planes)} planes; one launch takes at most {_MAX_PLANES}")
         device = planes[0].device
         if device.type != "cuda" and not _interpreting():
             raise ValueError(f"tensors must be on a CUDA device, got {device}")
@@ -283,14 +291,14 @@ class PlaneSet:
             [plane_address, rows_address, stride // width, block // width, block // width]
             for plane_address, rows_address, stride, block in entries
         ]
-        self.table = torch.tensor(table, dtype=torch.int64).to(device)
         self.planes = planes
         self.rows = rows
         self.capacity = capacity
-        self.width = width
+        self._table = torch.tensor(table, dtype=torch.int64).to(device)
+        self._width = width
         # 16-byte aligned starts imply 8-byte words: strides are then multiples of two words.
-        self.align = 16 // width if all(x % 16 == 0 for x in layout) else 1
-        self.max_words = max(row[_BLOCK_WORDS] for row in table)
+        self._align = 16 // width if all(x % 16 == 0 for x in layout) else 1
+        self._max_words = max(row[_BLOCK_WORDS] for row in table)
 
     def gather(self, block_ids: torch.Tensor, *, validate: bool = False) -> None:
         """rows[p][i] = planes[p][block_ids[i]] for every plane p and i < len(block_ids).
@@ -300,13 +308,13 @@ class PlaneSet:
         synchronizes with the host). Runs as kvkernels::gather_plane_set.
         """
         _gather_set_op(
-            self.table,
+            self._table,
             self.planes,
             self.rows,
             block_ids,
-            self.max_words,
-            self.width,
-            self.align,
+            self._max_words,
+            self._width,
+            self._align,
             validate,
         )
 
@@ -317,12 +325,12 @@ class PlaneSet:
         synchronizes with the host). Runs as kvkernels::scatter_plane_set.
         """
         _scatter_set_op(
-            self.table,
+            self._table,
             self.planes,
             self.rows,
             block_ids,
-            self.max_words,
-            self.width,
-            self.align,
+            self._max_words,
+            self._width,
+            self._align,
             validate,
         )
