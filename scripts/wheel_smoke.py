@@ -19,6 +19,7 @@ import sys
 PUBLIC = {
     "kvkernels.ops": [
         "CascadePlan",
+        "PlaneSet",
         "PrefixGroup",
         "cascade_decode_attention",
         "gather_kv_blocks",
@@ -51,6 +52,8 @@ PUBLIC = {
 REGISTERED_OPS = [
     "gather_kv_blocks",
     "scatter_kv_blocks",
+    "gather_plane_set",
+    "scatter_plane_set",
     "merge_attention_states",
     "merge_attention_states_n",
     "cascade_decode_attention",

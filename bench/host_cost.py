@@ -16,6 +16,11 @@ the difference between two rows is the cost of that layer:
 Two more rows give the scale: an empty custom op (dispatch alone) and
 torch.index_select on the same inputs. Inputs are small (512 ids, 16-byte KV
 blocks), as the harness uses for host_us, so the GPU work stays short.
+
+Two rows copy 32 layers, one plane each, as an offload does: a plane set (one
+launch for all of them) and 32 gather_kv_blocks calls. The plane set's target
+is under 2x one single-plane gather_kv_blocks call; the last line prints the
+ratio.
 """
 
 from __future__ import annotations
@@ -26,10 +31,12 @@ import torch
 
 from bench.harness import Tensors, host_us_per_call
 from kvkernels.ops import kv_gather
+from kvkernels.ops.plane_set import PlaneSet
 
 NUM_IDS = 512
 NUM_BLOCKS = 4096
 CALLS = 2000
+LAYERS = 32
 
 
 @torch.library.custom_op("kvkernels_probe::empty", mutates_args=("outs",))
@@ -77,6 +84,18 @@ def parts(device: str = "cuda") -> dict[str, Callable[[], None]]:
 
     flat_plane, flat_out, ids_long = plane.view(NUM_BLOCKS, -1), out.view(NUM_IDS, -1), ids.long()
 
+    layer_planes = [torch.zeros_like(plane) for _ in range(LAYERS)]
+    layer_outs = [torch.empty_like(out) for _ in range(LAYERS)]
+    plane_set = PlaneSet(layer_planes, layer_outs)
+    plane_set.gather(ids)  # autotune before timing
+
+    def plane_set_all_layers() -> None:
+        plane_set.gather(ids)
+
+    def per_layer_calls() -> None:
+        for layer_plane, layer_out in zip(layer_planes, layer_outs, strict=True):
+            kv_gather.gather_kv_blocks([layer_plane], ids, [layer_out])
+
     def index_select() -> None:
         torch.index_select(flat_plane, 0, ids_long, out=flat_out)
 
@@ -89,6 +108,8 @@ def parts(device: str = "cuda") -> dict[str, Callable[[], None]]:
         "autotuned launch": autotuned,
         "empty custom op": empty_op,
         "torch.index_select": index_select,
+        f"plane set, {LAYERS} layers": plane_set_all_layers,
+        f"gather_kv_blocks x {LAYERS} layers": per_layer_calls,
     }
 
 
@@ -104,8 +125,11 @@ def main() -> int:
     if not torch.cuda.is_available():
         raise SystemExit("needs a CUDA GPU")
     print(f"{torch.cuda.get_device_name()}, torch {torch.__version__}")
-    for name, us in measure().items():
-        print(f"{name:28s} {us:8.1f} us per call")
+    result = measure()
+    for name, us in result.items():
+        print(f"{name:32s} {us:8.1f} us per call")
+    ratio = result[f"plane set, {LAYERS} layers"] / result["gather_kv_blocks"]
+    print(f"plane set over {LAYERS} layers / one single-plane call: {ratio:.2f} (target below 2)")
     return 0
 
 

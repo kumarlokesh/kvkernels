@@ -27,6 +27,10 @@ passed on the released source, with the torch and Triton versions of that run.
 - Planning from a block table or slot list replays its four launches from a CUDA
   graph the plan records on the second call with the same tensors, so a step's
   planning costs one graph launch of CPU time.
+- `PlaneSet`: gather or scatter the same KV blocks in every plane of a cache
+  (all layers, K and V) in one launch. The planes and row buffers are checked
+  once and their addresses written to a device table, so each call checks only
+  the ids; calls can be captured in a CUDA graph.
 - `kvkernels.layouts`: the KV cache layouts of vLLM 0.32.0 and SGLang 0.5.22,
   and the views the ops take of them.
 - `kvkernels.reference`: PyTorch references for every op.

@@ -3,9 +3,11 @@
 from kvkernels.ops.cascade import CascadePlan, PrefixGroup, cascade_decode_attention
 from kvkernels.ops.kv_gather import gather_kv_blocks, scatter_kv_blocks
 from kvkernels.ops.merge_states import merge_attention_states, merge_attention_states_n
+from kvkernels.ops.plane_set import PlaneSet
 
 __all__ = [
     "CascadePlan",
+    "PlaneSet",
     "PrefixGroup",
     "cascade_decode_attention",
     "gather_kv_blocks",
