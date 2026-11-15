@@ -74,14 +74,14 @@ One decode step of one layer: Llama 3.1 8B attention (32 query heads, 8 KV heads
 
 | Batch | kvkernels (µs) | FlashInfer decode (µs) | FlashInfer cascade (µs) | speedup over FlashInfer decode | kvkernels, share of datasheet bandwidth |
 |---|---|---|---|---|---|
-| 1 | 172.0 | 151.6 | 165.9 | 0.88x | 69% |
-| 4 | 190.5 | 182.3 | 193.5 | 0.96x | 73% |
-| 16 | 306.2 | 622.6 | 292.9 | 2.03x | 73% |
-| 32 | 487.4 | 1305.6 | 435.2 | 2.68x | 69% |
-| 64 | 823.3 | 2456.6 | 717.8 | 2.98x | 68% |
-| 128 | 1554.4 | 5175.3 | 1412.1 | 3.33x | 65% |
+| 1 | 153.6 | 151.6 | 165.9 | 0.99x | 77% |
+| 4 | 181.2 | 180.2 | 192.5 | 0.99x | 77% |
+| 16 | 305.2 | 612.4 | 292.9 | 2.01x | 73% |
+| 32 | 487.4 | 1282.0 | 435.2 | 2.63x | 69% |
+| 64 | 821.2 | 2413.6 | 716.8 | 2.94x | 68% |
+| 128 | 1546.2 | 5057.5 | 1406.0 | 3.27x | 65% |
 
-<sub>NVIDIA L4, torch 2.14.1+cu126, Triton 3.8.0, commit <code>dirty-45097c07</code>; from <code>results/l4/cascade/20261115T083106Z.json</code></sub>
+<sub>NVIDIA L4, torch 2.14.1+cu126, Triton 3.8.0, commit <code>dirty-703f937d</code>; from <code>results/l4/cascade/20261115T130542Z.json</code></sub>
 <!-- results:cascade:end -->
 
 ## Limitations

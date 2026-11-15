@@ -74,14 +74,17 @@ def _copy_plane_set_kernel(  # type: ignore[no-untyped-def]
     plane_stride = tl.load(entry + 2)
     rows_stride = tl.load(entry + 3)
     block_words = tl.load(entry + 4)
-    if ALIGN > 1:
-        # Every block start in the set is 16-byte aligned.
-        plane_address = tl.multiple_of(plane_address, 16)
-        rows_address = tl.multiple_of(rows_address, 16)
-        plane_stride = tl.multiple_of(plane_stride, ALIGN)
-        rows_stride = tl.multiple_of(rows_stride, ALIGN)
     plane_ptr = plane_address.to(tl.pointer_type(WORD))
     rows_ptr = rows_address.to(tl.pointer_type(WORD))
+    if ALIGN > 1:
+        # Every block start and block size in the set is a multiple of 16 bytes.
+        # Without these hints the compiler cannot prove it for values read from
+        # the table, and the copy moves 8 bytes per load instead of 16.
+        plane_ptr = tl.multiple_of(plane_ptr, 16)
+        rows_ptr = tl.multiple_of(rows_ptr, 16)
+        plane_stride = tl.multiple_of(plane_stride, ALIGN)
+        rows_stride = tl.multiple_of(rows_stride, ALIGN)
+        block_words = tl.multiple_of(block_words, ALIGN)
     # 64-bit, because block id · block stride can pass 2**31 words.
     block = tl.load(ids_ptr + row).to(tl.int64)
     offs = tile * TILE + tl.arange(0, TILE)
@@ -234,6 +237,11 @@ def _scatter_set_fake(
     return None
 
 
+def _pinned_host(t: torch.Tensor, device: torch.device) -> bool:
+    """Pinned host memory that a kernel on the CUDA device can read and write directly."""
+    return device.type == "cuda" and t.device.type == "cpu" and t.is_pinned()
+
+
 class PlaneSet:
     """Planes and the row buffers they copy to and from, checked once, copied in one launch.
 
@@ -241,7 +249,9 @@ class PlaneSet:
         bytes. Planes may be views of one buffer and may interleave.
     rows[p]: [capacity, *block_shape_p], contiguous, same dtype as planes[p];
         the same capacity for every p. No row buffer may overlap a plane or
-        another row buffer.
+        another row buffer. A row buffer may be pinned host memory: the GPU
+        reaches it through the same address, so a gather writes it over PCIe
+        without a staging buffer, and a scatter reads it from there.
     A scatter into two planes that share a KV block leaves that block undefined,
     as a repeated id does.
     """
@@ -264,8 +274,10 @@ class PlaneSet:
             where = f"plane {p}"
             if plane.dim() < 1:
                 raise ValueError(f"{where}: needs a first dimension that indexes blocks")
-            if plane.device != device or row.device != device:
-                raise ValueError(f"{where}: every tensor must be on {device}")
+            if plane.device != device:
+                raise ValueError(f"{where}: every plane must be on {device}")
+            if row.device != device and not _pinned_host(row, device):
+                raise ValueError(f"{where}: rows must be on {device} or in pinned host memory")
             if row.dtype != plane.dtype:
                 raise ValueError(f"{where}: rows dtype {row.dtype} != plane {plane.dtype}")
             if row.dim() < 1 or row.shape[0] != capacity:

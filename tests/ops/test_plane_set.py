@@ -259,3 +259,60 @@ def test_runs_under_torch_compile() -> None:
     gather_kv_blocks_ref(planes, ids, expected)
     for row, ref in zip(rows, expected, strict=True):
         assert_exact(row, ref)
+
+
+def test_aligned_sets_compile_to_16_byte_loads_and_stores() -> None:
+    # The block addresses and sizes come from the table, so the compiler only
+    # knows they are 16-byte multiples from the kernel's hints; without them
+    # every copy is 8 bytes wide. Compiled offline for sm_89; no GPU needed.
+    import re
+
+    import triton.language as tl
+
+    from kvkernels.ops.plane_set import _copy_plane_set_kernel
+    from scripts.dump_kernel_ir import ARCHS, Example, compile_example
+
+    example = Example(
+        "plane_set",
+        _copy_plane_set_kernel,
+        {
+            "table_ptr": torch.empty(4, 5, dtype=torch.int64),
+            "ids_ptr": torch.empty(4, dtype=torch.int32),
+            "max_words": 8192,
+        },
+        {"IDS_INDEX_PLANE": True, "ALIGN": 2, "WORD": tl.int64, "TILE": 1024},
+        num_warps=8,
+        num_stages=3,
+    )
+    ptx = compile_example(example, ARCHS["sm_89"]).asm["ptx"]
+    assert re.search(r"ld\.global(\.[a-z]+)*\.v2\.b64", ptx)
+    assert re.search(r"st\.global(\.[a-z]+)*\.v2\.b64", ptx)
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize("layout", ["vllm_LBNHC", "sglang_nhd"])
+def test_rows_in_pinned_host_memory(layout: str) -> None:
+    block_size = 1 if layout == "sglang_nhd" else 16
+    planes = all_layer_planes(layout, 256, block_size, 8, 128, layers=4)
+    rows = [torch.zeros((8, *p.shape[1:]), dtype=p.dtype).pin_memory() for p in planes]
+    plane_set = PlaneSet(planes, rows)
+    ids = ids_tensor([200, 3, 77, 255, 0])
+    plane_set.gather(ids)
+    torch.cuda.synchronize()
+    expected = empty_rows(planes, 5)
+    gather_kv_blocks_ref(planes, ids, expected)
+    for row, ref in zip(rows, expected, strict=True):
+        assert_exact(row[:5], ref.cpu())
+    for row in rows:
+        row[:5].random_(0, 100)
+    plane_set.scatter(ids)
+    torch.cuda.synchronize()
+    for plane, row in zip(planes, rows, strict=True):
+        assert_exact(plane[ids.long()].cpu(), row[:5])
+
+
+@pytest.mark.gpu
+def test_rejects_rows_in_pageable_host_memory() -> None:
+    planes = all_layer_planes("vllm_LBNHC", 16, 16, 8, 128, layers=1)
+    with pytest.raises(ValueError, match="pinned"):
+        PlaneSet(planes, [torch.zeros((2, *planes[0].shape[1:]), dtype=planes[0].dtype)])

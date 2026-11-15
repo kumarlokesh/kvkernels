@@ -288,6 +288,12 @@ def check_case(case: Case) -> None:
         raise ValueError(f"case {case.params}: tolerance check needs reference_fp32")
 
     def outputs_on_host(inputs: Tensors) -> Tensors:
+        import torch
+
+        # .cpu() of a tensor already in host memory returns it without waiting for
+        # the GPU, so wait here for copies still in flight to a pinned host output.
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
         return {out: inputs[out].cpu() for out in case.outputs}
 
     ref_inputs = case.prepared(names[0], case.setup_for(names[0]))

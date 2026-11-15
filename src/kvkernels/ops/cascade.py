@@ -35,7 +35,10 @@ run the same kernel with different tiles:
 On an L4 the prefix tiles of 128 rows and 8 warps took 1.6-1.8x less time than
 64 rows and 4 warps at batch 64 and 128 with prefixes of 8,192 and 32,768
 tokens, 1.2x less at batch 32, and up to 7% more at batch 16, where an item
-has only 64 rows per KV head.
+has only 64 rows per KV head. A group of at most small_item_rows rows (four
+requests with a GQA group of 4) runs in the suffix launch's tiles instead: in
+a 128-row tile it wasted most of the tile, and batch 1 took 42 us per layer
+instead of 38.
 
 Split-K: when a launch's tasks without splitting would give fewer than
 programs_per_sm · SMs programs, each of its items' tokens are cut into ranges
@@ -119,6 +122,7 @@ class CascadePlan:
         suffix_block_m: int = 16,
         block_n: int | None = None,
         min_shared_tokens: int = 64,
+        small_item_rows: int = 16,
         batch_invariant: bool = False,
     ) -> None:
         if num_q_heads % num_kv_heads:
@@ -141,6 +145,7 @@ class CascadePlan:
         self.device = device
         self.max_splits = MAX_SPLITS
         self.min_shared_tokens = min_shared_tokens
+        self.small_item_rows = small_item_rows
         self.min_shared_blocks = max(1, math.ceil(min_shared_tokens / block_size))
         self.batch_invariant = batch_invariant
         self.max_tasks = max_tasks or (64 * max_groups + MAX_SPLITS * max_requests)
@@ -149,8 +154,9 @@ class CascadePlan:
         # A batch-invariant plan must fit with split-K, which it never turns off.
         splits = MAX_SPLITS if batch_invariant else 1
         need_parts = (1 if batch_invariant else 2) * max_requests * num_q_heads * splits
+        small_groups = 0 if batch_invariant else min(max_groups, max_requests // 2)
         need_tasks = max(
-            max_requests * splits,
+            max_requests * splits + small_groups * math.ceil(small_item_rows / suffix_block_m),
             0
             if batch_invariant
             else max_groups + math.ceil(max_requests * self.group / prefix_block_m),
@@ -276,7 +282,9 @@ class CascadePlan:
                         len(grp.requests),
                         grp.blocks,
                         grp.length,
-                        self.prefix_block_m,
+                        self.suffix_block_m
+                        if len(grp.requests) * g <= self.small_item_rows
+                        else self.prefix_block_m,
                     )
                 )
         for r, (blocks, length) in enumerate(zip(suffix_blocks, suffix_lens, strict=True)):

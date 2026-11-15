@@ -20,6 +20,7 @@ Steps, in the order they run:
     kv_gather      the kv_gather suite
     kv_gather_layers
                    the kv_gather_layers suite: every layer's planes in one call
+    kv_offload     the kv_offload suite: one request's KV, every layer, to pinned host memory
     matmul         the experiments' matmul suite; needs test-gpu-experiments
     attention      the experiments' fused attention suite; needs test-gpu-experiments
     cascade        the cascade suite
@@ -102,6 +103,7 @@ STEPS = (
     Step("timer", "uv run python -m bench.timer_check"),
     Step("kv_gather", _suite("kv_gather"), writes_results=True, needs=RESULT_TESTS),
     Step("kv_gather_layers", _suite("kv_gather_layers"), writes_results=True, needs=RESULT_TESTS),
+    Step("kv_offload", _suite("kv_offload"), writes_results=True, needs=RESULT_TESTS),
     Step("matmul", _suite("experiments-matmul"), writes_results=True, needs=EXPERIMENT_TESTS),
     Step(
         "attention",

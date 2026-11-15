@@ -30,7 +30,11 @@ passed on the released source, with the torch and Triton versions of that run.
 - `PlaneSet`: gather or scatter the same KV blocks in every plane of a cache
   (all layers, K and V) in one launch. The planes and row buffers are checked
   once and their addresses written to a device table, so each call checks only
-  the ids; calls can be captured in a CUDA graph.
+  the ids; calls can be captured in a CUDA graph. Row buffers may be pinned host
+  memory: a gather then writes straight to the host over PCIe. That keeps the
+  kernel on the SMs for the whole transfer; on an L4 it slowed a matmul on
+  another stream 1.7x, against 1.16x for gathers of 8 layers at a time into a
+  GPU buffer, each copied to the host on a second stream.
 - `kvkernels.layouts`: the KV cache layouts of vLLM 0.32.0 and SGLang 0.5.22,
   and the views the ops take of them.
 - `kvkernels.reference`: PyTorch references for every op.
@@ -46,8 +50,9 @@ passed on the released source, with the torch and Triton versions of that run.
 - The cascade's prefix tiles are 128 query rows with 8 warps and 3 pipeline
   stages (64 rows and 4 warps before). On an L4 one layer at batch 64 and 128
   with a 32,768-token prefix takes 1.5-1.6x less time; batch 16 takes up to 3%
-  more and batch 1 4 us more. `CascadePlan(prefix_block_m=64)` gives 64-row
-  prefix tiles, still with 8 warps.
+  more. `CascadePlan(prefix_block_m=64)` gives 64-row prefix tiles, still with
+  8 warps. A group of at most `small_item_rows` query rows (default 16: four
+  requests with a GQA group of 4) runs in the suffix launch's 16-row tiles.
 - Split-K counts the prefix launch's programs and the suffix launch's programs
   separately. With both counted together, a batch with many suffixes left its
   prefix unsplit: batch 128, 32,768-token prefix, 128-token suffixes took

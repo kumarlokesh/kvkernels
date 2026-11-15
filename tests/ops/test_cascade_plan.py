@@ -395,6 +395,35 @@ def test_the_prefix_is_split_when_suffix_programs_alone_fill_the_gpu() -> None:
     check(setup, *attend(setup, plan))
 
 
+@pytest.mark.parametrize("small_item_rows", [0, 16, 64])
+def test_small_groups_run_in_suffix_tiles_and_both_planners_agree(small_item_rows: int) -> None:
+    # Six requests share blocks 1-4 (24 rows), two share blocks 5-7 (8 rows),
+    # and two share nothing. GQA group 4, suffix tiles of 16 rows.
+    a, b = [1, 2, 3, 4], [5, 6, 7]
+    rows = [[*a, 10 + r] for r in range(6)] + [[*b, 20 + r] for r in range(2)]
+    rows += [[30, 31], [32]]
+    lens = [4 * 4 + 3] * 6 + [3 * 4 + 2] * 2 + [7, 4]
+    batch = explicit_batch(rows, lens, 4)
+    setup = build(batch)
+    plan = new_plan(setup, batch, num_sms=1, small_item_rows=small_item_rows)
+    plan_device(plan, setup)
+    _, groups = found_groups(plan)
+    assert sorted(g.rows for g in groups) == [2, 6]
+    large = [g for g in groups if g.rows * plan.group > small_item_rows]
+    small = [g for g in groups if g.rows * plan.group <= small_item_rows]
+    # One SM: no split-K, so a large group has one 128-row tile, a small group
+    # ceil(rows / 16) tiles, and each request with a suffix one task.
+    assert int(plan.counts[0]) == len(large)
+    suffix_tasks = sum(-(-g.rows * plan.group // 16) for g in small) + len(rows)
+    assert int(plan.counts[1]) == suffix_tasks
+    device_out, device_lse = attend(setup, plan)
+    check(setup, device_out, device_lse)
+    host_update(plan, batch, groups)
+    host_out, host_lse = attend(setup, plan)
+    assert torch.equal(device_out, host_out)
+    assert torch.equal(device_lse, host_lse)
+
+
 def test_split_k_falls_back_to_one_range_when_parts_do_not_fit() -> None:
     shared = list(range(1, 13))
     batch = explicit_batch([[*shared, 13], [*shared, 14], list(range(15, 27))], [52, 50, 48], 4)

@@ -222,8 +222,10 @@ def _items_kernel(  # type: ignore[no-untyped-def]
     block_n,
     kv_heads,
     q_heads,
+    small_rows,
     GROUP: tl.constexpr,
     PREFIX_BM: tl.constexpr,
+    SUFFIX_BM: tl.constexpr,
     MAX_SPLITS: tl.constexpr,
     PER_TOKEN: tl.constexpr,
     INVARIANT: tl.constexpr,
@@ -261,7 +263,12 @@ def _items_kernel(  # type: ignore[no-untyped-def]
     shared_blocks = tl.where(in_group, run_shared, 0)
     group_len = tl.where(is_group, run_shared * block_size, 0)  # set at a group's first row
     group_rows = run_size * GROUP
-    group_tiles = tl.where(is_group, tl.cdiv(group_rows, PREFIX_BM), 0)
+    # A group of at most small_rows rows runs in the suffix launch's tiles.
+    small = is_group & (group_rows <= small_rows)
+    large = is_group & (group_rows > small_rows)
+    group_tiles = tl.where(
+        large, tl.cdiv(group_rows, PREFIX_BM), tl.where(small, tl.cdiv(group_rows, SUFFIX_BM), 0)
+    )
     suffix_len = tl.where(ok, length - shared_blocks * block_size, 0)
     has_suffix = suffix_len > 0
     suffix_index = num_groups + tl.cumsum(has_suffix.to(tl.int32), 0) - 1
@@ -270,8 +277,11 @@ def _items_kernel(  # type: ignore[no-untyped-def]
     # Split-K, with a fallback to one range per item when the batch would not fit.
     # Each launch's programs are counted alone: the prefix and suffix launches
     # run one after the other.
-    g_base = kv_heads * tl.sum(group_tiles, 0)
-    s_base = kv_heads * tl.sum(has_suffix.to(tl.int32), 0)
+    p_base = kv_heads * tl.sum(tl.where(large, group_tiles, 0), 0)
+    s_base = kv_heads * (
+        tl.sum(tl.where(small, group_tiles, 0), 0) + tl.sum(has_suffix.to(tl.int32), 0)
+    )
+    g_base = tl.where(small, s_base, p_base)
     _, g_ranges = _ranges(
         group_len, g_base, True, target_programs, min_split, block_n, MAX_SPLITS, INVARIANT
     )
@@ -280,10 +290,11 @@ def _items_kernel(  # type: ignore[no-untyped-def]
     )
     g_parts = group_rows * kv_heads * g_ranges
     s_parts = GROUP * kv_heads * s_ranges
+    g_tasks = group_tiles * g_ranges
     fits = (
         (tl.sum(tl.where(is_group, g_parts, 0), 0) + tl.sum(s_parts, 0) <= max_parts)
-        & (tl.sum(group_tiles * g_ranges, 0) <= max_tasks)
-        & (tl.sum(s_ranges, 0) <= max_tasks)
+        & (tl.sum(tl.where(large, g_tasks, 0), 0) <= max_tasks)
+        & (tl.sum(tl.where(small, g_tasks, 0), 0) + tl.sum(s_ranges, 0) <= max_tasks)
     )
     g_span1, g_ranges1 = _ranges(
         group_len, g_base, fits, target_programs, min_split, block_n, MAX_SPLITS, INVARIANT
@@ -294,10 +305,16 @@ def _items_kernel(  # type: ignore[no-untyped-def]
     g_parts = tl.where(is_group, group_rows * kv_heads * g_ranges1, 0)
     s_parts = GROUP * kv_heads * s_ranges1
     g_tasks = group_tiles * g_ranges1
+    large_tasks = tl.where(large, g_tasks, 0)
+    small_tasks = tl.where(small, g_tasks, 0)
 
-    # Offsets: groups first, then suffix items, each in sorted-row order.
-    g_task_start = tl.cumsum(g_tasks, 0) - g_tasks
-    s_task_start = tl.cumsum(s_ranges1, 0) - s_ranges1
+    # Offsets: groups first, then suffix items, each in sorted-row order. The
+    # prefix task table holds the large groups; the suffix task table holds the
+    # small groups, then the suffix items.
+    g_task_start = tl.where(
+        large, tl.cumsum(large_tasks, 0) - large_tasks, tl.cumsum(small_tasks, 0) - small_tasks
+    )
+    s_task_start = tl.sum(small_tasks, 0) + tl.cumsum(s_ranges1, 0) - s_ranges1
     g_part_start = tl.cumsum(g_parts, 0) - g_parts
     s_part_start = tl.sum(g_parts, 0) + tl.cumsum(s_parts, 0) - s_parts
 
@@ -352,8 +369,8 @@ def _items_kernel(  # type: ignore[no-untyped-def]
         tl.store(merge_start_ptr + row, first, mask=ok)
         tl.store(merge_end_ptr + row, first + per_row, mask=ok)
 
-    tl.store(counts_ptr + 0, tl.sum(g_tasks, 0))
-    tl.store(counts_ptr + 1, tl.sum(s_ranges1, 0))
+    tl.store(counts_ptr + 0, tl.sum(large_tasks, 0))
+    tl.store(counts_ptr + 1, tl.sum(small_tasks, 0) + tl.sum(s_ranges1, 0))
     tl.store(counts_ptr + 2, num_requests * q_heads)
     tl.store(counts_ptr + 3, num_groups)
     tl.store(counts_ptr + 4, num_items)
@@ -375,6 +392,7 @@ def _fill_kernel(  # type: ignore[no-untyped-def]
     max_tasks,
     kv_heads,
     q_heads,
+    small_rows,
     GROUP: tl.constexpr,
     PREFIX_BM: tl.constexpr,
     SUFFIX_BM: tl.constexpr,
@@ -383,11 +401,12 @@ def _fill_kernel(  # type: ignore[no-untyped-def]
     item = tl.program_id(0)
     if item >= tl.load(counts_ptr + 4):
         return
-    is_prefix = item < tl.load(counts_ptr + 3)
-    bm = tl.where(is_prefix, PREFIX_BM, SUFFIX_BM)
-    table = tasks_ptr + tl.where(is_prefix, 0, 5 * max_tasks)
     req_start = tl.load(item_req_start_ptr + item)
     rows = tl.load(item_num_reqs_ptr + item) * GROUP
+    # Large groups use the prefix launch; small groups and suffix items the suffix launch.
+    is_large = (item < tl.load(counts_ptr + 3)) & (rows > small_rows)
+    bm = tl.where(is_large, PREFIX_BM, SUFFIX_BM)
+    table = tasks_ptr + tl.where(is_large, 0, 5 * max_tasks)
     length = tl.load(item_info_ptr + item)
     ranges = tl.load(item_info_ptr + max_items + item)
     span = tl.load(item_info_ptr + 2 * max_items + item)
@@ -512,8 +531,10 @@ def planning_launches(
             plan.block_n,
             plan.num_kv_heads,
             plan.num_q_heads,
+            plan.small_item_rows,
             GROUP=plan.group,
             PREFIX_BM=plan.prefix_block_m,
+            SUFFIX_BM=plan.suffix_block_m,
             MAX_SPLITS=plan.max_splits,
             PER_TOKEN=per_token,
             INVARIANT=plan.batch_invariant,
@@ -535,6 +556,7 @@ def planning_launches(
             plan.max_tasks,
             plan.num_kv_heads,
             plan.num_q_heads,
+            plan.small_item_rows,
             GROUP=plan.group,
             PREFIX_BM=plan.prefix_block_m,
             SUFFIX_BM=plan.suffix_block_m,
