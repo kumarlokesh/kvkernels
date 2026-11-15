@@ -70,4 +70,11 @@ passed on the released source, with the torch and Triton versions of that run.
   1-128 and prefixes of 512-32,768 tokens the cascade takes 0.96x the time of
   the earlier rule (geometric mean of 267 cases), 0.74x at best and 1.06x at
   worst; batch 1 with a 512-token prefix takes 24.6 us per layer instead of
-  30.7.
+  30.7. A launch whose programs already fill the GPU once is not split.
+- The cascade's prefix launch runs 4 warps and 2 pipeline stages (8 and 3
+  before), and both attention launches read keys in tiles of 32 tokens (64
+  before), so two prefix programs fit on an SM; split-K ranges are at least 2
+  tokens per query row. On an L4 the cascade takes 0.97x the time over the
+  suite (geometric mean of 267 cases), 0.83x at best and 1.14x at worst
+  (batch 128, 2,048-token prefix, 128-token suffixes); batch 1 with a
+  512-token prefix takes 21.5 us per layer.
