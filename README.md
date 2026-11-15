@@ -54,6 +54,12 @@ versions. All numbers: [results/README.md](results/README.md).
 ### KV block gather
 
 <!-- results:kv_gather:begin -->
+On a NVIDIA L4, kvkernels gathers 4,096 KV blocks from vLLM's default layout at 240 GB/s, 102% of the GPU's measured copy bandwidth (index_select 243 GB/s, vLLM copy kernel 237 GB/s, cuMemcpyBatchAsync 60 GB/s).
+
+<picture><source media="(prefers-color-scheme: dark)" srcset="figures/l4/kv_gather-dark.svg"><img alt="Gather of 4,096 KV blocks (64 KiB each, random order) on a NVIDIA L4" src="figures/l4/kv_gather-light.svg" width="720"></picture>
+
+<sub>NVIDIA L4, torch 2.14.1+cu126, Triton 3.8.0, commit <code>dirty-de4213be</code>; from <code>results/l4/kv_gather/20261115T000021Z.json</code></sub>
+
 On a Tesla T4, kvkernels gathers 512 KV blocks from vLLM's default layout at 223 GB/s, 94% of the GPU's measured copy bandwidth (index_select 232 GB/s, vLLM copy kernel 213 GB/s, cuMemcpyBatchAsync 58 GB/s).
 
 <picture><source media="(prefers-color-scheme: dark)" srcset="figures/t4/kv_gather-dark.svg"><img alt="Gather of 512 KV blocks (64 KiB each, random order) on a Tesla T4" src="figures/t4/kv_gather-light.svg" width="720"></picture>
@@ -64,7 +70,18 @@ On a Tesla T4, kvkernels gathers 512 KV blocks from vLLM's default layout at 223
 ### Cascade decode attention
 
 <!-- results:cascade:begin -->
-No results yet.
+One decode step of one layer: Llama 3.1 8B attention (32 query heads, 8 KV heads, head_dim 128), one shared prefix of 8,192 tokens, a 512-token suffix per request, vLLM's layout with 16-token KV blocks, fp16. Median time; bandwidth counts the bytes a cascade needs (the prefix read once).
+
+| Batch | kvkernels (µs) | FlashInfer decode (µs) | FlashInfer cascade (µs) | speedup over FlashInfer decode | kvkernels, share of datasheet bandwidth |
+|---|---|---|---|---|---|
+| 1 | 195.6 | 151.6 | 165.9 | 0.77x | 61% |
+| 4 | 190.5 | 181.2 | 193.5 | 0.95x | 73% |
+| 16 | 510.0 | 611.3 | 291.8 | 1.20x | 44% |
+| 32 | 646.1 | 1275.9 | 434.2 | 1.97x | 52% |
+| 64 | 926.7 | 2392.1 | 716.8 | 2.58x | 60% |
+| 128 | 1852.4 | 5115.4 | 1403.9 | 2.76x | 54% |
+
+<sub>NVIDIA L4, torch 2.14.1+cu126, Triton 3.8.0, commit <code>dirty-de4213be</code>; from <code>results/l4/cascade/20261115T042026Z.json</code></sub>
 <!-- results:cascade:end -->
 
 ## Limitations

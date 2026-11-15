@@ -59,6 +59,13 @@ KV_GATHER_ROW = {
     "order": "random",
     "dtype": "float16",
 }
+KV_BLOCK_BYTES = 16 * 8 * 128 * 2 * 2  # one KV block of the row above: K and V, fp16
+# The timer clears L2 by reading, so the last L2-sized part of a gather's output
+# is still in L2, not yet written to device memory, when the timer stops. A
+# gather whose output is a few times the L2 size gives a bandwidth that device
+# memory can sustain; at 512 blocks on an L4 (32 MiB written, 48 MiB of L2) the
+# figure was 184% of the measured copy bandwidth.
+OUTPUT_OVER_L2 = 4
 CASCADE_ROW = {
     "model": "llama-3.1-8b",
     "groups": 1,
@@ -221,11 +228,31 @@ class Section:
     figures: Files
 
 
+def gather_row(result: Result) -> dict[str, Any]:
+    """The gather row for this result: the fewest KV blocks whose output exceeds L2 enough.
+
+    The smallest num_ids in the file whose output is at least OUTPUT_OVER_L2 times
+    the GPU's L2 size; the largest num_ids in the file if none is, or the default
+    row's if the GPU has no spec.
+    """
+    from kvkernels.specs import SPECS
+
+    spec = SPECS.get(result["env"]["gpu_slug"])
+    others = {k: v for k, v in KV_GATHER_ROW.items() if k != "num_ids"}
+    sizes = sorted({m["params"]["num_ids"] for m in result["measurements"] if matches(m, others)})
+    if spec is None or not sizes:
+        return KV_GATHER_ROW
+    large = [n for n in sizes if n * KV_BLOCK_BYTES >= OUTPUT_OVER_L2 * spec.l2_bytes]
+    return {**KV_GATHER_ROW, "num_ids": large[0] if large else sizes[-1]}
+
+
 def kv_gather_section(result: Result) -> Section | None:
     table_lines = kv_gather_table(result)
     if table_lines is None:
         return None
-    fixed = {**KV_GATHER_ROW, "layout": "vllm_LBNHC"}
+    row = gather_row(result)
+    blocks = row["num_ids"]
+    fixed = {**row, "layout": "vllm_LBNHC"}
     found = {impl: find(result, impl, fixed) for impl in KV_GATHER_IMPLS}
     ours = found["kvkernels"]
     if ours is None:
@@ -242,12 +269,12 @@ def kv_gather_section(result: Result) -> Section | None:
     bars = [bars[0], *sorted(bars[1:], key=lambda bar: -bar[1])]
     copy = found["copy_ceiling"]
     ceiling = ("plain copy, no indexing", copy["gbps"]) if copy else None
-    title = f"Gather of 512 KV blocks (64 KiB each, random order) on a {gpu_name}"
+    title = f"Gather of {blocks:,} KV blocks (64 KiB each, random order) on a {gpu_name}"
     charts = bar_chart(bars, ceiling, title, "GB/s")
     paths = {theme: f"figures/{gpu}/kv_gather-{theme}.svg" for theme in charts}
 
     summary = (
-        f"On a {gpu_name}, kvkernels gathers 512 KV blocks from vLLM's default layout at"
+        f"On a {gpu_name}, kvkernels gathers {blocks:,} KV blocks from vLLM's default layout at"
         f" {ours['gbps']:.0f} GB/s"
     )
     if ours["pct_measured_bw"] is not None:
@@ -270,11 +297,12 @@ def cascade_section(result: Result) -> Section | None:
 
 def kv_gather_table(result: Result) -> list[str] | None:
     impls = [i for i in KV_GATHER_IMPLS if any(m["impl"] == i for m in result["measurements"])]
+    row = gather_row(result)
     rows = []
     for layout, name in KV_GATHER_LAYOUTS.items():
         cells = [name]
         for impl in impls:
-            m = find(result, impl, {**KV_GATHER_ROW, "layout": layout})
+            m = find(result, impl, {**row, "layout": layout})
             if m is None or m["gbps"] is None:
                 cells.append(MISSING)
             elif m["pct_measured_bw"] is None:
@@ -286,7 +314,7 @@ def kv_gather_table(result: Result) -> list[str] | None:
     if not rows:
         return None
     return [
-        "Gather of 512 KV blocks in random order, 16-token KV blocks, 8 KV heads,"
+        f"Gather of {row['num_ids']:,} KV blocks in random order, 16-token KV blocks, 8 KV heads,"
         " head_dim 128, fp16. GB/s, and in brackets the share of the measured copy"
         f" bandwidth ({result['measured_peak_gbps']:.0f} GB/s).",
         "",

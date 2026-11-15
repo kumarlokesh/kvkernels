@@ -32,8 +32,8 @@ def env(slug: str) -> dict[str, Any]:
     }
 
 
-def gather(layout: str, impl: str, gbps: float) -> dict[str, Any]:
-    params = {**readme_results.KV_GATHER_ROW, "layout": layout}
+def gather(layout: str, impl: str, gbps: float, num_ids: int = 512) -> dict[str, Any]:
+    params = {**readme_results.KV_GATHER_ROW, "layout": layout, "num_ids": num_ids}
     return {"params": params, "impl": impl, "gbps": gbps, "pct_measured_bw": gbps / 200}
 
 
@@ -102,6 +102,19 @@ def test_the_gather_section_has_a_summary_a_chart_per_theme_and_the_numbers(
     tables = figures["results/README.md"].decode()
     assert "| vLLM default | 180 (90%) |" in tables
     assert "results/l4/kv_gather/20261101T000000Z.json" in tables
+
+
+def test_the_gather_shown_is_the_smallest_whose_output_is_four_times_l2(tmp_path: Path) -> None:
+    # L4: 48 MiB of L2. 512 blocks write 32 MiB, 2,048 write 128 MiB, 4,096 write 256 MiB.
+    measurements = [
+        gather("vllm_LBNHC", "kvkernels", gbps, num_ids=n)
+        for n, gbps in ((512, 431), (2048, 299), (4096, 240), (32768, 234))
+    ]
+    write(tmp_path, "l4", "kv_gather", "20261101T000000Z", measurements)
+    text, files = readme_results.render(README, tmp_path / "results", tmp_path)
+    assert "kvkernels gathers 4,096 KV blocks from vLLM's default layout at 240 GB/s" in text
+    tables = files["results/README.md"].decode()
+    assert "Gather of 4,096 KV blocks" in tables and "| vLLM default | 240 (120%) |" in tables
 
 
 def test_cascade_rows_and_speedup(tmp_path: Path) -> None:
