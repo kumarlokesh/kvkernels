@@ -66,6 +66,7 @@ passed on the released source, with the torch and Triton versions of that run.
   suffix programs per SM by default: `prefix_programs_per_sm`,
   `programs_per_sm`), and the shortest range is 4 tokens per query row of the
   item's tile, between 128 and `min_split_tokens` (512). On an L4 over batch
-  1-128 and prefixes of 512-32,768 tokens this takes 0.935x the time of the
-  earlier rule (geometric mean), 0.72x at best and 1.06x at worst; batch 1
-  with a 512-token prefix takes 23.6 us per layer instead of 31.7.
+  1-128 and prefixes of 512-32,768 tokens the cascade takes 0.96x the time of
+  the earlier rule (geometric mean of 267 cases), 0.74x at best and 1.06x at
+  worst; batch 1 with a 512-token prefix takes 24.6 us per layer instead of
+  30.7.
