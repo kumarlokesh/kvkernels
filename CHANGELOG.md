@@ -31,10 +31,11 @@ passed on the released source, with the torch and Triton versions of that run.
   (all layers, K and V) in one launch. The planes and row buffers are checked
   once and their addresses written to a device table, so each call checks only
   the ids; calls can be captured in a CUDA graph. Row buffers may be pinned host
-  memory: a gather then writes straight to the host over PCIe. That keeps the
-  kernel on the SMs for the whole transfer; on an L4 it slowed a matmul on
-  another stream 1.7x, against 1.16x for gathers of 8 layers at a time into a
-  GPU buffer, each copied to the host on a second stream.
+  memory: a gather then writes straight to the host over PCIe, and a scatter
+  reads from it. That keeps the kernel on the SMs for the whole transfer; on
+  an L4 it slowed a matmul on another stream 1.7x, against 1.16x for gathers of
+  8 layers at a time into a GPU buffer, each copied to the host on a second
+  stream.
 - `kvkernels.layouts`: the KV cache layouts of vLLM 0.32.0 and SGLang 0.5.22,
   and the views the ops take of them.
 - `kvkernels.reference`: PyTorch references for every op.

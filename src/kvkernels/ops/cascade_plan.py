@@ -173,6 +173,8 @@ def _ranges(  # type: ignore[no-untyped-def]
             better = (s <= cap) & (rounds * splits < best_rounds * s)
             splits = tl.where(better, s, splits)
             best_rounds = tl.where(better, rounds, best_rounds)
+        # A launch that fills a round already gets no split: more ranges add merge work.
+        splits = tl.where(base_programs >= target, 1, splits)
     splits = tl.minimum(tl.maximum(splits, 1), MAX_SPLITS)
     splits = tl.where(allow_split, splits, 1)
     span = tl.cdiv(tl.cdiv(tl.maximum(length, 1), splits), block_n) * block_n

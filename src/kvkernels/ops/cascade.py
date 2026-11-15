@@ -28,39 +28,43 @@ consecutive in the batch; out[r] is always request r.
 Three launches: prefix tasks, suffix tasks, merge. The two attention launches
 run the same kernel with different tiles:
 
-    launch    rows per tile        warps   pipeline stages
-    prefix    128, 64 or 32        8       3                 many requests' rows per item
-    suffix     16                  4       2                 one request's GQA group per item
+    launch    rows per tile    warps   stages   programs per SM
+    prefix    128, 64 or 32    4       2        2                many requests' rows per item
+    suffix     16              4       2        2                one request's GQA group per item
 
-On an L4 the prefix tiles of 128 rows and 8 warps took 1.6-1.8x less time than
-64 rows and 4 warps at batch 64 and 128 with prefixes of 8,192 and 32,768
-tokens, 1.2x less at batch 32, and up to 7% more at batch 16. A prefix task of
-at most 64 or 32 rows runs in a 64- or 32-row tile (prefix_min_block_m, default
-a quarter of the prefix tile; see prefix_attention). A group of at most
+Both launches read keys in tiles of 32 tokens (block_n). A prefix task of at
+most 64 or 32 rows runs in a 64- or 32-row tile (prefix_min_block_m, default a
+quarter of the prefix tile; see prefix_attention). A group of at most
 small_item_rows rows (four requests with a GQA group of 4) runs in the suffix
-launch's tiles instead: in a 128-row tile it wasted most of the tile, and
-batch 1 took 42 us per layer instead of 38.
+launch's tiles instead.
+
+With 4 warps each warp holds 32 query rows of a 128-row tile. Compiled for
+sm_89 the prefix launch uses 255 registers per thread, 48 bytes of stack and
+40 KB of shared memory, so two programs fit on an SM; with 64-token key tiles
+it spilled 1 KB per thread. On an L4, against 8 warps, 3 stages and 64-token
+key tiles, it took 0.83-0.88x the time at batch 64-128 with prefixes of 8,192
+and more, and 0.97x over the probe grid.
 
 Split-K cuts an item's tokens into s ranges, each its own task, so a launch
 with few tasks still fills the GPU. Each launch is counted alone, since the
 two run one after the other. With base programs before splitting and R
-programs that run at once (prefix launch: prefix_programs_per_sm · SMs, 1 by
-default: 226 registers per thread leave room for one program of 8 warps;
-suffix launch: programs_per_sm · SMs), a launch takes about
+programs that run at once (prefix_programs_per_sm · SMs for the prefix launch,
+programs_per_sm · SMs for the suffix launch), a launch takes about
 ceil(base · s / R) rounds of ranges 1/s as long, so s is the value from 1 to
-its cap that makes ceil(base · s / R) / s smallest:
+its cap that makes ceil(base · s / R) / s smallest, ties to the smaller:
 
-    base 32, R 58      s = 1: 1 round      1/1 = 1.00
-                       s = 4: 3 rounds     3/4 = 0.75
-                       s = 9: 5 rounds     5/9 = 0.56   ◀ chosen
+    base 32, R 116     s = 1: 1 round      1/1 = 1.00
+                       s = 3: 1 round      1/3 = 0.33
+                       s = 7: 2 rounds     2/7 = 0.29   ◀ chosen
 
-The cap is MAX_SPLITS and ceil(length / shortest range), with the shortest
-range clamp(SPLIT_TOKENS_PER_ROW · tile rows, MIN_SPLIT_FLOOR, min_split_tokens):
-each range writes a partial result of rows x head_dim in fp32 that the merge
-reads back, and at 4 tokens per row that is at most half the KV bytes the
-range reads. On an L4 over 144 cases (batch 1-128, prefix 512-32,768, both
-models) this rule took 0.935x the time of the earlier one (ceil(2 SMs / base)
-ranges of at least 512 tokens), 0.72x at best and 1.06x at worst.
+A launch with base >= R fills a round already and is not split: more ranges
+would add partial results for the merge to read. The cap is MAX_SPLITS and
+ceil(length / shortest range), with the shortest range
+clamp(SPLIT_TOKENS_PER_ROW · tile rows, MIN_SPLIT_FLOOR, min_split_tokens).
+On an L4 over 144 cases (batch 1-128, prefix 512-32,768, both models) the
+round rule took 0.935x the time of the earlier one (ceil(2 SMs / base) ranges
+of at least 512 tokens); the guard took a further 0.99x over 72 cases with
+suffixes of 128-2,048 tokens.
 """
 
 from __future__ import annotations
@@ -80,12 +84,12 @@ from kvkernels.ops.prefix_attention import attend
 MAX_SPLITS = 16
 # Split-K ranges are at least SPLIT_TOKENS_PER_ROW tokens per query row of the
 # item's tile, and at least MIN_SPLIT_FLOOR tokens, up to min_split_tokens.
-SPLIT_TOKENS_PER_ROW = 4
+SPLIT_TOKENS_PER_ROW = 2
 MIN_SPLIT_FLOOR = 128
 TASK_WAVES = 8  # attention programs per KV head: TASK_WAVES · programs_per_sm · SMs / KV heads
 MERGE_PROGRAMS_PER_SM = 32  # merge programs are small; many fit on one SM
 # Warps and pipeline stages of each attention launch; see the module docstring.
-PREFIX_WARPS, PREFIX_STAGES = 8, 3
+PREFIX_WARPS, PREFIX_STAGES = 4, 2
 SUFFIX_WARPS, SUFFIX_STAGES = 4, 2
 HEAD_DIMS = (64, 128)
 _IN_DTYPES = (torch.float16, torch.bfloat16)
@@ -135,7 +139,7 @@ class CascadePlan:
         max_parts: int | None = None,
         num_sms: int | None = None,
         programs_per_sm: int = 2,
-        prefix_programs_per_sm: int = 1,
+        prefix_programs_per_sm: int = 2,
         min_split_tokens: int = 512,
         prefix_block_m: int = 128,
         prefix_min_block_m: int | None = None,
@@ -207,7 +211,7 @@ class CascadePlan:
         self.prefix_block_m = prefix_block_m
         self.prefix_min_block_m = prefix_min_block_m
         self.suffix_block_m = suffix_block_m
-        self.block_n = block_n or (16 if _interpreting() else 64)
+        self.block_n = block_n or (16 if _interpreting() else 32)
         self.max_rows = max_requests * num_q_heads
         # Fixed grids that loop over the batch's work, a few times larger than
         # what the GPU runs at once so that uneven tasks still spread out.
@@ -295,10 +299,12 @@ class CascadePlan:
     def _splits(self, length: int, base_programs: int, rows: int, block_m: int) -> int:
         if self.batch_invariant:
             return max(1, min(MAX_SPLITS, math.ceil(length / self.min_split_tokens)))
+        resident = self.target_programs(block_m)
+        if base_programs >= resident:
+            return 1  # the launch fills a round already; more ranges add merge work
         # The ranges whose programs fill the launch's rounds best: time is about
         # (rounds of programs) x (tokens per range) = ceil(base · s / R) / s.
         cap = max(1, min(MAX_SPLITS, math.ceil(length / self.min_range_tokens(min(rows, block_m)))))
-        resident = self.target_programs(block_m)
         base = max(base_programs, 1)
         best_s, best_rounds = 1, math.ceil(base / resident)
         for s in range(2, cap + 1):

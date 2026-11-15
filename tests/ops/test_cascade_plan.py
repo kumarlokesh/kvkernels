@@ -655,16 +655,21 @@ def test_planning_and_attention_capture_in_one_cuda_graph() -> None:
 @pytest.mark.parametrize(
     ("length", "base_programs", "rows", "block_m", "splits"),
     [
-        # 32 prefix programs, 58 fit at once: 9 ranges make 288 programs in 5
-        # rounds, 5/9 of a 1-range round each; 16 ranges need 9 rounds (9/16).
-        (32768, 32, 512, 128, 9),
-        # A 64-row group: ranges of at least 256 tokens, so at most 8; 7 ranges
-        # fill one round, 8 need two.
-        (2048, 8, 64, 128, 7),
-        # A 4-row suffix-launch item: ranges of at least 128 tokens, 116 programs fit.
+        # 58 SMs, 2 programs per SM: 116 run at once. 32 prefix programs: 7
+        # ranges make 224 programs in 2 rounds, 2/7 of a 1-range round each
+        # (14 ranges tie; ties go to fewer ranges).
+        (32768, 32, 512, 128, 7),
+        # A 64-row group: ranges of at least 2 · 64 = 128 tokens, so at most 16;
+        # 14 ranges make 112 programs, one round.
+        (2048, 8, 64, 128, 14),
+        # A 4-row suffix-launch item: ranges of at least 128 tokens, so at most 4.
         (512, 8, 4, 16, 4),
-        # 580 programs fill 10 rounds exactly; more ranges only tie: one range.
-        (32768, 580, 512, 128, 1),
+        # 58 programs: 2 ranges fill one round of 116.
+        (32768, 58, 512, 128, 2),
+        # A launch that fills a round already is not split: 600 programs would
+        # round better in more ranges, but the merge would read more partial results.
+        (32768, 600, 512, 128, 1),
+        (32768, 116, 512, 128, 1),
     ],
 )
 def test_split_k_picks_the_range_count_that_fills_whole_rounds(

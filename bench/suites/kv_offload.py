@@ -23,12 +23,31 @@ one pinned host buffer, rows of plane p at host[p]:
                                    holds the same bytes: the PCIe bandwidth the
                                    others are compared with
 
+Reload cases (op "reload") run the other way: one pinned host buffer holds the
+request's KV, and each entry writes it into the request's KV blocks of every
+plane; the check compares those blocks:
+
+    torch_copy_then_index_copy     one copy of the host buffer to a GPU staging
+                                   buffer; then index_copy_ per plane (reference)
+    kvkernels_staging              one copy to the staging buffer; then one
+                                   plane-set scatter
+    kvkernels_staging_chunked      four chunks of 8 layers: chunk i is copied on a
+                                   second stream while chunk i-1 is scattered
+    kvkernels_from_host            one plane-set scatter whose row buffers are the
+                                   host buffer: the kernel's loads cross PCIe
+    vllm_batched_dma               vLLM v0.33.0's reload of KV blocks of 28 KiB and
+                                   more: one cuMemcpyBatchAsync call from the host
+                                   buffer to the cache, source access order ANY,
+                                   on a side stream (vLLM layout only)
+    copy_ceiling                   one copy of the host buffer to a GPU buffer
+
 Plane sets and job lists are built in the plan step, outside the timed call.
 bytes_moved counts the bytes that cross PCIe once.
 """
 
 from __future__ import annotations
 
+import itertools
 from collections.abc import Callable, Iterator
 from typing import Any
 
@@ -59,14 +78,31 @@ def bytes_moved(p: Params) -> int:
     return num_ids(p) * block_bytes(p) * LAYERS * planes_per_layer(str(p["layout"]))
 
 
+class _Inputs(dict[str, Any]):
+    """The case's tensors; "loaded", the request's blocks in every plane, is read after the call."""
+
+    def __missing__(self, key: str) -> Any:
+        if key != "loaded":
+            raise KeyError(key)
+        import torch
+
+        return torch.stack([plane[self["ids_long"]] for plane in self["planes"]])
+
+
 def make_inputs(
-    params: Params, *, tiny_blocks: bool = False, filled_staging: bool = False
+    params: Params,
+    *,
+    tiny_blocks: bool = False,
+    filled_staging: bool = False,
+    filled_cache: bool = False,
 ) -> Tensors:
     """The cache's planes, the request's KV block ids, a GPU staging buffer, a pinned host buffer.
 
     tiny_blocks keeps the planes and ids but shrinks every block to 16 bytes, for
     measuring the CPU cost of a call. filled_staging fills the staging buffer with
-    the request's blocks, the source copy_ceiling copies.
+    the request's blocks, the source copy_ceiling copies. filled_cache writes a
+    reload case's host rows into the request's blocks, the state every other
+    reload entry leaves, so the reload copy_ceiling passes the check.
     """
     import torch
 
@@ -95,13 +131,28 @@ def make_inputs(
         for plane, rows in zip(all_planes, staging, strict=True):
             rows.copy_(plane[ids])
     host = torch.zeros(shape, dtype=torch.float16).pin_memory()
-    inputs: dict[str, Any] = {
-        "planes": all_planes,
-        "ids": ids.to(torch.int32),
-        "ids_long": ids,
-        "staging": staging,
-        "host": host,
-    }
+    if params["op"] == "reload":
+        host.view(torch.uint8).copy_(
+            torch.randint(
+                0,
+                256,
+                host.view(torch.uint8).shape,
+                dtype=torch.uint8,
+                generator=torch.Generator().manual_seed(2),
+            )
+        )
+    if filled_cache:
+        for plane, rows in zip(all_planes, host, strict=True):
+            plane[ids] = rows.to("cuda")
+    inputs = _Inputs(
+        {
+            "planes": all_planes,
+            "ids": ids.to(torch.int32),
+            "ids_long": ids,
+            "staging": staging,
+            "host": host,
+        }
+    )
     return inputs
 
 
@@ -216,10 +267,138 @@ class VllmBatchedDma:
         current.wait_stream(self.side)
 
 
+# --- reload implementations ------------------------------------------------
+
+
+def torch_copy_then_index_copy(t: Tensors) -> None:
+    t["staging"].copy_(t["host"], non_blocking=True)
+    planes: Any = t["planes"]
+    for plane, rows in zip(planes, t["staging"], strict=True):
+        plane.view(plane.shape[0], -1).index_copy_(0, t["ids_long"], rows.view(rows.shape[0], -1))
+
+
+def reload_copy_ceiling(t: Tensors) -> None:
+    t["staging"].copy_(t["host"], non_blocking=True)
+
+
+class KvkernelsReloadStaging:
+    def plan(self, t: Tensors) -> None:
+        from kvkernels.ops.plane_set import PlaneSet
+
+        planes: Any = t["planes"]
+        t["plane_set"] = PlaneSet(planes, list(t["staging"]))  # type: ignore[assignment]
+
+    def run(self, t: Tensors) -> None:
+        t["staging"].copy_(t["host"], non_blocking=True)
+        plane_set: Any = t["plane_set"]
+        plane_set.scatter(t["ids"])
+
+
+class KvkernelsReloadChunked:
+    """CHUNKS plane sets; chunk i is copied in on a second stream while chunk i-1 is scattered."""
+
+    def __init__(self) -> None:
+        self.side: Any = None
+
+    def plan(self, t: Tensors) -> None:
+        import torch
+
+        from kvkernels.ops.plane_set import PlaneSet
+
+        planes: Any = t["planes"]
+        per_chunk = len(planes) // CHUNKS
+        bounds = [(c * per_chunk, (c + 1) * per_chunk) for c in range(CHUNKS)]
+        events = [torch.cuda.Event() for _ in bounds]  # type: ignore[no-untyped-call]
+        t["chunks"] = [  # type: ignore[assignment]
+            (PlaneSet(planes[a:b], list(t["staging"][a:b])), a, b, copied)
+            for (a, b), copied in zip(bounds, events, strict=True)
+        ]
+        if self.side is None:
+            self.side = torch.cuda.Stream()  # type: ignore[no-untyped-call]
+
+    def run(self, t: Tensors) -> None:
+        import torch
+
+        current = torch.cuda.current_stream()
+        chunks: Any = t["chunks"]
+        self.side.wait_stream(current)
+        with torch.cuda.stream(self.side):
+            for _, a, b, copied in chunks:
+                t["staging"][a:b].copy_(t["host"][a:b], non_blocking=True)
+                copied.record()
+        for plane_set, _, _, copied in chunks:
+            current.wait_event(copied)
+            plane_set.scatter(t["ids"])
+
+
+class KvkernelsFromHost:
+    def plan(self, t: Tensors) -> None:
+        from kvkernels.ops.plane_set import PlaneSet
+
+        planes: Any = t["planes"]
+        t["plane_set"] = PlaneSet(planes, list(t["host"]))  # type: ignore[assignment]
+
+    def run(self, t: Tensors) -> None:
+        plane_set: Any = t["plane_set"]
+        plane_set.scatter(t["ids"])
+
+
+class VllmBatchedDmaReload(VllmBatchedDma):
+    """vLLM v0.33.0's CPU-to-GPU reload of large KV blocks: the same batched copy, reversed."""
+
+    def run(self, t: Tensors) -> None:
+        import torch
+
+        from bench.baselines.vllm.batched_dma import copy_batch
+
+        host_side, cache_side, sizes = t["dma_jobs"]  # built by VllmBatchedDma.plan
+        current = torch.cuda.current_stream()
+        self.side.wait_stream(current)
+        copy_batch(cache_side, host_side, sizes, self.side.cuda_stream, src_access_any=True)
+        current.wait_stream(self.side)
+
+
 # --- cases ------------------------------------------------------------------
 
 
+def make_reload_case(params: Params, *, with_dma: bool) -> Case:
+    staging, chunked, from_host = (
+        KvkernelsReloadStaging(),
+        KvkernelsReloadChunked(),
+        KvkernelsFromHost(),
+    )
+    impls: dict[str, Callable[[Tensors], None]] = {
+        "torch_copy_then_index_copy": torch_copy_then_index_copy,
+        "kvkernels_staging": staging.run,
+        "kvkernels_staging_chunked": chunked.run,
+        "kvkernels_from_host": from_host.run,
+        "copy_ceiling": reload_copy_ceiling,
+    }
+    plans: dict[str, Callable[[Tensors], None]] = {
+        "kvkernels_staging": staging.plan,
+        "kvkernels_staging_chunked": chunked.plan,
+        "kvkernels_from_host": from_host.plan,
+    }
+    if with_dma and str(params["layout"]).startswith("vllm"):
+        dma = VllmBatchedDmaReload()
+        impls["vllm_batched_dma"] = dma.run
+        plans["vllm_batched_dma"] = dma.plan
+    return Case(
+        params=params,
+        setup=lambda: make_inputs(params),
+        impls=impls,
+        outputs=("loaded",),
+        check="exact",
+        bytes_moved=bytes_moved,
+        host_setup=lambda: make_inputs(params, tiny_blocks=True),
+        plans=plans,
+        setups={"copy_ceiling": lambda: make_inputs(params, filled_cache=True)},
+    )
+
+
 def make_case(params: Params, *, with_dma: bool) -> Case:
+    if params["op"] == "reload":
+        return make_reload_case(params, with_dma=with_dma)
     staging, chunked, to_host = KvkernelsStaging(), KvkernelsStagingChunked(), KvkernelsToHost()
     impls: dict[str, Callable[[Tensors], None]] = {
         "torch_index_select_then_copy": torch_index_select_then_copy,
@@ -251,18 +430,17 @@ def make_case(params: Params, *, with_dma: bool) -> Case:
 
 
 def grid() -> Iterator[Params]:
-    for layout, block in LAYOUTS.items():
-        for tokens in TOKENS:
-            yield {
-                "op": "offload",
-                "layout": layout,
-                "layers": LAYERS,
-                "block": block,
-                "kv_heads": HEADS,
-                "head_dim": HEAD_DIM,
-                "tokens": tokens,
-                "dtype": "float16",
-            }
+    for op, layout, tokens in itertools.product(("offload", "reload"), LAYOUTS, TOKENS):
+        yield {
+            "op": op,
+            "layout": layout,
+            "layers": LAYERS,
+            "block": LAYOUTS[layout],
+            "kv_heads": HEADS,
+            "head_dim": HEAD_DIM,
+            "tokens": tokens,
+            "dtype": "float16",
+        }
 
 
 def cases() -> Iterator[Case]:
