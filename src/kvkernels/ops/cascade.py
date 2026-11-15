@@ -387,7 +387,12 @@ class CascadePlan:
             return 1  # the launch fills a round already; more ranges add merge work
         # The ranges whose programs fill the launch's rounds best: time is about
         # (rounds of programs) x (tokens per range) = ceil(base · s / R) / s.
-        cap = max(1, min(MAX_SPLITS, math.ceil(length / self.min_range_tokens(min(rows, block_m)))))
+        # Each range also writes, and the merge reads, an fp32 partial result per
+        # row: 8 bytes per row and head dimension against 4 per token of K and V.
+        # Ranges of at least 2 tokens per row of the item keep that traffic below
+        # the KV's.
+        shortest = max(self.min_range_tokens(min(rows, block_m)), self.split_tokens_per_row * rows)
+        cap = max(1, min(MAX_SPLITS, math.ceil(length / shortest)))
         base = max(base_programs, 1)
         best_s, best_rounds = 1, math.ceil(base / resident)
         for s in range(2, cap + 1):

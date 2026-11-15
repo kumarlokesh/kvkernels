@@ -671,6 +671,10 @@ def test_planning_and_attention_capture_in_one_cuda_graph() -> None:
         # round better in more ranges, but the merge would read more partial results.
         (32768, 600, 512, 128, 1),
         (32768, 116, 512, 128, 1),
+        # An item of 1,024 rows (64 requests, 4 query tokens, GQA group 4): each
+        # range writes and the merge reads 8 bytes per row and head dimension, so
+        # ranges hold at least 2 · 1,024 tokens: 2 ranges of a 4,096-token node.
+        (4096, 32, 1024, 128, 2),
     ],
 )
 def test_split_k_picks_the_range_count_that_fills_whole_rounds(

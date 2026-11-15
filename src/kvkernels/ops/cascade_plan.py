@@ -192,6 +192,7 @@ def _tree_kernel(  # type: ignore[no-untyped-def]
 def _ranges(  # type: ignore[no-untyped-def]
     length,
     rows,
+    item_rows,
     base_programs,
     allow_split,
     target,
@@ -210,6 +211,9 @@ def _ranges(  # type: ignore[no-untyped-def]
         splits = tl.cdiv(length, min_split)
     else:
         min_tokens = tl.minimum(min_split, tl.maximum(split_floor, split_per_row * rows))
+        # Partial results cost 8 bytes per row and head dimension per range: keep
+        # ranges at least split_per_row tokens per row of the whole item.
+        min_tokens = tl.maximum(min_tokens, split_per_row * item_rows)
         cap = tl.minimum(tl.maximum(tl.cdiv(length, min_tokens), 1), MAX_SPLITS)
         # The s whose programs fill the launch's rounds best: ceil(base · s / R) / s
         # smallest, compared as ceil(base · s / R) · best_s < best_rounds · s.
@@ -378,6 +382,7 @@ def _items_kernel(  # type: ignore[no-untyped-def]
     _, g_ranges = _ranges(
         group_len,
         g_tile_rows,
+        group_rows,
         g_base,
         True,
         g_target,
@@ -391,6 +396,7 @@ def _items_kernel(  # type: ignore[no-untyped-def]
     _, s_ranges = _ranges(
         suffix_len,
         s_tile_rows,
+        rows_per_request,
         s_base,
         True,
         suffix_target,
@@ -412,6 +418,7 @@ def _items_kernel(  # type: ignore[no-untyped-def]
     g_span1, g_ranges1 = _ranges(
         group_len,
         g_tile_rows,
+        group_rows,
         g_base,
         fits,
         g_target,
@@ -425,6 +432,7 @@ def _items_kernel(  # type: ignore[no-untyped-def]
     s_span1, s_ranges1 = _ranges(
         suffix_len,
         s_tile_rows,
+        rows_per_request,
         s_base,
         fits,
         suffix_target,
@@ -534,6 +542,11 @@ def _fill_kernel(  # type: ignore[no-untyped-def]
     item = tl.program_id(0)
     if item >= tl.load(counts_ptr + 4):
         return
+    # Programs (item, c) for c < num_programs(1) share the item's tasks and
+    # merge entries, BLOCK at a time: an item of many rows and ranges has tens
+    # of thousands of entries.
+    part = tl.program_id(1)
+    stride = tl.num_programs(1) * BLOCK
     req_start = tl.load(item_req_start_ptr + item)
     rows_per_request = GROUP * query_tokens
     rows = tl.load(item_num_reqs_ptr + item) * rows_per_request
@@ -552,7 +565,7 @@ def _fill_kernel(  # type: ignore[no-untyped-def]
     # Tasks: row tiles outer, token ranges inner; a task's partial results are
     # kv_heads · tile_rows consecutive slots.
     num_tasks = tl.cdiv(rows, bm) * ranges
-    for first in range(0, num_tasks, BLOCK):
+    for first in range(part * BLOCK, num_tasks, stride):
         k = first + lanes
         live = k < num_tasks
         tile = k // ranges
@@ -569,7 +582,7 @@ def _fill_kernel(  # type: ignore[no-untyped-def]
 
     # Merge entries: (item row, KV head, range) ──▶ the row's list, after merge_offset entries.
     num_entries = rows * kv_heads * ranges
-    for first in range(0, num_entries, BLOCK):
+    for first in range(part * BLOCK, num_entries, stride):
         e = first + lanes
         live = e < num_entries
         rng = e % ranges
@@ -578,7 +591,7 @@ def _fill_kernel(  # type: ignore[no-untyped-def]
         item_row = rest // kv_heads
         tile = item_row // bm
         tile_rows = tl.minimum(bm, rows - tile * bm)
-        part = (
+        slot = (
             part_start
             + tile * ranges * kv_heads * bm
             + rng * kv_heads * tile_rows
@@ -589,7 +602,10 @@ def _fill_kernel(  # type: ignore[no-untyped-def]
         token = (item_row // GROUP) % query_tokens
         row = (request * query_tokens + token) * q_heads + kv * GROUP + item_row % GROUP
         dest = tl.load(merge_start_ptr + row, mask=live, other=0) + merge_offset + rng
-        tl.store(merge_indices_ptr + dest, part, mask=live)
+        tl.store(merge_indices_ptr + dest, slot, mask=live)
+
+
+FILL_PROGRAMS = 8  # programs per item in the fill launch
 
 
 def _warps(block: int) -> int:
@@ -679,7 +695,7 @@ def planning_launches(
         )
 
     def fill() -> None:
-        _fill_kernel[(max_items,)](
+        _fill_kernel[(max_items, FILL_PROGRAMS)](
             plan.perm,
             plan.item_req_start,
             plan.item_num_reqs,

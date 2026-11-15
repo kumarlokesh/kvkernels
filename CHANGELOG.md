@@ -36,6 +36,18 @@ passed on the released source, with the torch and Triton versions of that run.
   an L4 it slowed a matmul on another stream 1.7x, against 1.16x for gathers of
   8 layers at a time into a GPU buffer, each copied to the host on a second
   stream.
+- The cascade reads every level of a prefix tree once: planning on the GPU
+  finds the tree from the block table or slot list (`CascadePlan(max_levels=4)`;
+  1 gives the earlier one level of groups), and each node is a work item over
+  the requests below it. `PrefixGroup.start` names nested groups for the host
+  plan.
+- Several new query tokens per request (`CascadePlan(query_tokens=...)`, 1 to
+  16, for speculative decoding's verification step): q, out and lse_out hold
+  `requests · query_tokens` rows, and token t sees the request's keys up to
+  position length - query_tokens + t.
+- fp8 (e4m3) K and V in the cascade, with one K and one V scale per layer
+  (`cascade_decode_attention(..., k_scale=, v_scale=)`), as vLLM's and SGLang's
+  default fp8 caches store them; K and V views accept float8_e4m3fn.
 - `kvkernels.layouts`: the KV cache layouts of vLLM 0.32.0 and SGLang 0.5.22,
   and the views the ops take of them.
 - `kvkernels.reference`: PyTorch references for every op.
@@ -82,3 +94,11 @@ passed on the released source, with the torch and Triton versions of that run.
   (`min_shared_tokens`, 64 before). On an L4, groups sharing 16-256 tokens
   took 0.98-1.07x the time of reading those tokens with each request; from 512
   tokens they took 0.61-1.03x.
+- A plan for one request, or a batch-invariant plan, leaves out the prefix
+  launch, which has no work then: on an L4 it took 2.0 us of the 19.7 us of a
+  batch-1 call (Llama 3.1 8B, 512 tokens) replayed from a CUDA graph.
+- Planning on the GPU runs three launches instead of four: one launch finds the
+  prefix tree by sorting and binary search, and the fill launch splits each
+  item's tasks and merge entries over 8 programs.
+- Split-K ranges hold at least 2 tokens per query row of the whole item, since
+  each range writes and the merge reads a partial result per row.

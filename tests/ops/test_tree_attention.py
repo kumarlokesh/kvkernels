@@ -337,7 +337,7 @@ def test_a_range_with_no_visible_keys_gives_an_empty_partial() -> None:
     batch = explicit_batch(rows, [32, 30], 4)
     setup = build(batch, query_tokens=8)
     plan = new_plan(setup, batch, query_tokens=8, num_sms=64, min_split_tokens=4, block_n=16)
-    plan.min_split_floor = 4
+    plan.min_split_floor, plan.split_tokens_per_row = 4, 0  # ranges as short as 4 tokens
     plan_device(plan, setup)
     assert int(plan.item_info[1, : int(plan.counts[4])].max()) > 1, "suffixes should split"
     check(setup, *attend(setup, plan), query_tokens=8)
