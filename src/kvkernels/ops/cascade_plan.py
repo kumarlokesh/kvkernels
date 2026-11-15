@@ -143,21 +143,36 @@ def _common_kernel(  # type: ignore[no-untyped-def]
 @triton.jit
 def _ranges(  # type: ignore[no-untyped-def]
     length,
+    rows,
     base_programs,
     allow_split,
     target,
     min_split,
+    split_floor,
+    split_per_row,
     block_n,
     MAX_SPLITS: tl.constexpr,
     INVARIANT: tl.constexpr,
 ):
-    """Split-K token span and number of ranges for items of the given lengths."""
-    by_length = tl.cdiv(length, min_split)
+    """Split-K token span and number of ranges for items of the given lengths.
+
+    rows: query rows of the item's tile; target: programs of its launch that run at once.
+    """
     if INVARIANT:
-        splits = by_length
+        splits = tl.cdiv(length, min_split)
     else:
-        by_fill = tl.cdiv(target, tl.maximum(base_programs, 1))
-        splits = tl.where(base_programs >= target, 1, tl.minimum(by_length, by_fill))
+        min_tokens = tl.minimum(min_split, tl.maximum(split_floor, split_per_row * rows))
+        cap = tl.minimum(tl.maximum(tl.cdiv(length, min_tokens), 1), MAX_SPLITS)
+        # The s whose programs fill the launch's rounds best: ceil(base · s / R) / s
+        # smallest, compared as ceil(base · s / R) · best_s < best_rounds · s.
+        base = tl.maximum(base_programs, 1)
+        splits = tl.full(length.shape, 1, tl.int32)
+        best_rounds = tl.cdiv(base, target) + splits * 0
+        for s in tl.static_range(2, MAX_SPLITS + 1):
+            rounds = tl.cdiv(base * s, target)
+            better = (s <= cap) & (rounds * splits < best_rounds * s)
+            splits = tl.where(better, s, splits)
+            best_rounds = tl.where(better, rounds, best_rounds)
     splits = tl.minimum(tl.maximum(splits, 1), MAX_SPLITS)
     splits = tl.where(allow_split, splits, 1)
     span = tl.cdiv(tl.cdiv(tl.maximum(length, 1), splits), block_n) * block_n
@@ -217,8 +232,11 @@ def _items_kernel(  # type: ignore[no-untyped-def]
     max_items,
     max_tasks,
     max_parts,
-    target_programs,
+    prefix_target,
+    suffix_target,
     min_split,
+    split_floor,
+    split_per_row,
     block_n,
     kv_heads,
     q_heads,
@@ -282,11 +300,33 @@ def _items_kernel(  # type: ignore[no-untyped-def]
         tl.sum(tl.where(small, group_tiles, 0), 0) + tl.sum(has_suffix.to(tl.int32), 0)
     )
     g_base = tl.where(small, s_base, p_base)
+    g_target = tl.where(small, suffix_target, prefix_target)
+    g_tile_rows = tl.minimum(group_rows, tl.where(small, SUFFIX_BM, PREFIX_BM))
     _, g_ranges = _ranges(
-        group_len, g_base, True, target_programs, min_split, block_n, MAX_SPLITS, INVARIANT
+        group_len,
+        g_tile_rows,
+        g_base,
+        True,
+        g_target,
+        min_split,
+        split_floor,
+        split_per_row,
+        block_n,
+        MAX_SPLITS,
+        INVARIANT,
     )
     _, s_ranges = _ranges(
-        suffix_len, s_base, True, target_programs, min_split, block_n, MAX_SPLITS, INVARIANT
+        suffix_len,
+        GROUP,
+        s_base,
+        True,
+        suffix_target,
+        min_split,
+        split_floor,
+        split_per_row,
+        block_n,
+        MAX_SPLITS,
+        INVARIANT,
     )
     g_parts = group_rows * kv_heads * g_ranges
     s_parts = GROUP * kv_heads * s_ranges
@@ -297,10 +337,30 @@ def _items_kernel(  # type: ignore[no-untyped-def]
         & (tl.sum(tl.where(small, g_tasks, 0), 0) + tl.sum(s_ranges, 0) <= max_tasks)
     )
     g_span1, g_ranges1 = _ranges(
-        group_len, g_base, fits, target_programs, min_split, block_n, MAX_SPLITS, INVARIANT
+        group_len,
+        g_tile_rows,
+        g_base,
+        fits,
+        g_target,
+        min_split,
+        split_floor,
+        split_per_row,
+        block_n,
+        MAX_SPLITS,
+        INVARIANT,
     )
     s_span1, s_ranges1 = _ranges(
-        suffix_len, s_base, fits, target_programs, min_split, block_n, MAX_SPLITS, INVARIANT
+        suffix_len,
+        GROUP,
+        s_base,
+        fits,
+        suffix_target,
+        min_split,
+        split_floor,
+        split_per_row,
+        block_n,
+        MAX_SPLITS,
+        INVARIANT,
     )
     g_parts = tl.where(is_group, group_rows * kv_heads * g_ranges1, 0)
     s_parts = GROUP * kv_heads * s_ranges1
@@ -526,8 +586,11 @@ def planning_launches(
             max_items,
             plan.max_tasks,
             plan.max_parts,
-            plan.programs_per_sm * plan.num_sms,
+            plan.target_programs(plan.prefix_block_m),
+            plan.target_programs(plan.suffix_block_m),
             plan.min_split_tokens,
+            plan.min_split_floor,
+            plan.split_tokens_per_row,
             plan.block_n,
             plan.num_kv_heads,
             plan.num_q_heads,

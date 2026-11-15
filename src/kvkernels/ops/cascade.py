@@ -28,25 +28,39 @@ consecutive in the batch; out[r] is always request r.
 Three launches: prefix tasks, suffix tasks, merge. The two attention launches
 run the same kernel with different tiles:
 
-    launch    rows per tile   warps   pipeline stages
-    prefix    128             8       3                 many requests' rows per item
-    suffix     16             4       2                 one request's GQA group per item
+    launch    rows per tile        warps   pipeline stages
+    prefix    128, 64 or 32        8       3                 many requests' rows per item
+    suffix     16                  4       2                 one request's GQA group per item
 
 On an L4 the prefix tiles of 128 rows and 8 warps took 1.6-1.8x less time than
 64 rows and 4 warps at batch 64 and 128 with prefixes of 8,192 and 32,768
-tokens, 1.2x less at batch 32, and up to 7% more at batch 16, where an item
-has only 64 rows per KV head. A group of at most small_item_rows rows (four
-requests with a GQA group of 4) runs in the suffix launch's tiles instead: in
-a 128-row tile it wasted most of the tile, and batch 1 took 42 us per layer
-instead of 38.
+tokens, 1.2x less at batch 32, and up to 7% more at batch 16. A prefix task of
+at most 64 or 32 rows runs in a 64- or 32-row tile (prefix_min_block_m, default
+a quarter of the prefix tile; see prefix_attention). A group of at most
+small_item_rows rows (four requests with a GQA group of 4) runs in the suffix
+launch's tiles instead: in a 128-row tile it wasted most of the tile, and
+batch 1 took 42 us per layer instead of 38.
 
-Split-K: when a launch's tasks without splitting would give fewer than
-programs_per_sm · SMs programs, each of its items' tokens are cut into ranges
-of at least min_split_tokens, up to MAX_SPLITS, so small batches still fill the
-GPU. Each launch is counted alone, since the two run one after the other: with
-the suffix programs counted in, a batch of 128 requests left its prefix item
-unsplit, 64 programs on 58 SMs, and the prefix launch took 2.9 ms instead of
-2.0 ms on an L4 (prefix of 32,768 tokens).
+Split-K cuts an item's tokens into s ranges, each its own task, so a launch
+with few tasks still fills the GPU. Each launch is counted alone, since the
+two run one after the other. With base programs before splitting and R
+programs that run at once (prefix launch: prefix_programs_per_sm · SMs, 1 by
+default: 226 registers per thread leave room for one program of 8 warps;
+suffix launch: programs_per_sm · SMs), a launch takes about
+ceil(base · s / R) rounds of ranges 1/s as long, so s is the value from 1 to
+its cap that makes ceil(base · s / R) / s smallest:
+
+    base 32, R 58      s = 1: 1 round      1/1 = 1.00
+                       s = 4: 3 rounds     3/4 = 0.75
+                       s = 9: 5 rounds     5/9 = 0.56   ◀ chosen
+
+The cap is MAX_SPLITS and ceil(length / shortest range), with the shortest
+range clamp(SPLIT_TOKENS_PER_ROW · tile rows, MIN_SPLIT_FLOOR, min_split_tokens):
+each range writes a partial result of rows x head_dim in fp32 that the merge
+reads back, and at 4 tokens per row that is at most half the KV bytes the
+range reads. On an L4 over 144 cases (batch 1-128, prefix 512-32,768, both
+models) this rule took 0.935x the time of the earlier one (ceil(2 SMs / base)
+ranges of at least 512 tokens), 0.72x at best and 1.06x at worst.
 """
 
 from __future__ import annotations
@@ -64,6 +78,10 @@ from kvkernels.ops.merge_states import merge_ragged
 from kvkernels.ops.prefix_attention import attend
 
 MAX_SPLITS = 16
+# Split-K ranges are at least SPLIT_TOKENS_PER_ROW tokens per query row of the
+# item's tile, and at least MIN_SPLIT_FLOOR tokens, up to min_split_tokens.
+SPLIT_TOKENS_PER_ROW = 4
+MIN_SPLIT_FLOOR = 128
 TASK_WAVES = 8  # attention programs per KV head: TASK_WAVES · programs_per_sm · SMs / KV heads
 MERGE_PROGRAMS_PER_SM = 32  # merge programs are small; many fit on one SM
 # Warps and pipeline stages of each attention launch; see the module docstring.
@@ -117,8 +135,10 @@ class CascadePlan:
         max_parts: int | None = None,
         num_sms: int | None = None,
         programs_per_sm: int = 2,
+        prefix_programs_per_sm: int = 1,
         min_split_tokens: int = 512,
         prefix_block_m: int = 128,
+        prefix_min_block_m: int | None = None,
         suffix_block_m: int = 16,
         block_n: int | None = None,
         min_shared_tokens: int = 64,
@@ -134,6 +154,13 @@ class CascadePlan:
             raise ValueError(f"head_dim must be one of {HEAD_DIMS}, got {head_dim}")
         if prefix_block_m == suffix_block_m:
             raise ValueError("prefix and suffix row tiles must differ in height")
+        prefix_min_block_m = prefix_min_block_m or max(16, prefix_block_m // 4)
+        if prefix_min_block_m not in (prefix_block_m, prefix_block_m // 2, prefix_block_m // 4):
+            raise ValueError(
+                f"prefix_min_block_m {prefix_min_block_m}: must be prefix_block_m, /2 or /4"
+            )
+        if prefix_min_block_m < 16:
+            raise ValueError(f"prefix_min_block_m {prefix_min_block_m} is below 16")
         self.max_requests = max_requests
         self.max_groups = max_groups
         self.max_blocks = max_blocks
@@ -173,8 +200,12 @@ class CascadePlan:
             )
         self.num_sms = num_sms
         self.programs_per_sm = programs_per_sm
+        self.prefix_programs_per_sm = prefix_programs_per_sm
         self.min_split_tokens = min_split_tokens
+        self.split_tokens_per_row = SPLIT_TOKENS_PER_ROW
+        self.min_split_floor = MIN_SPLIT_FLOOR
         self.prefix_block_m = prefix_block_m
+        self.prefix_min_block_m = prefix_min_block_m
         self.suffix_block_m = suffix_block_m
         self.block_n = block_n or (16 if _interpreting() else 64)
         self.max_rows = max_requests * num_q_heads
@@ -249,14 +280,32 @@ class CascadePlan:
                 if not 0 <= b < self.num_blocks:
                     raise ValueError(f"{name}: block {b} is outside 0 … {self.num_blocks - 1}")
 
-    def _splits(self, length: int, base_programs: int) -> int:
-        by_length = math.ceil(length / self.min_split_tokens)
+    def min_range_tokens(self, rows: int) -> int:
+        """Shortest split-K range for an item whose tile holds rows query rows."""
+        by_rows = max(self.min_split_floor, self.split_tokens_per_row * rows)
+        return min(self.min_split_tokens, by_rows)
+
+    def target_programs(self, block_m: int) -> int:
+        """Programs of one launch that run at once: what split-K aims to fill."""
+        per_sm = (
+            self.prefix_programs_per_sm if block_m == self.prefix_block_m else self.programs_per_sm
+        )
+        return per_sm * self.num_sms
+
+    def _splits(self, length: int, base_programs: int, rows: int, block_m: int) -> int:
         if self.batch_invariant:
-            return max(1, min(MAX_SPLITS, by_length))
-        target = self.programs_per_sm * self.num_sms
-        if base_programs >= target:
-            return 1
-        return max(1, min(MAX_SPLITS, by_length, math.ceil(target / max(base_programs, 1))))
+            return max(1, min(MAX_SPLITS, math.ceil(length / self.min_split_tokens)))
+        # The ranges whose programs fill the launch's rounds best: time is about
+        # (rounds of programs) x (tokens per range) = ceil(base · s / R) / s.
+        cap = max(1, min(MAX_SPLITS, math.ceil(length / self.min_range_tokens(min(rows, block_m)))))
+        resident = self.target_programs(block_m)
+        base = max(base_programs, 1)
+        best_s, best_rounds = 1, math.ceil(base / resident)
+        for s in range(2, cap + 1):
+            rounds = math.ceil(base * s / resident)
+            if rounds * best_s < best_rounds * s:
+                best_s, best_rounds = s, rounds
+        return best_s
 
     def update(
         self,
@@ -308,7 +357,7 @@ class CascadePlan:
             num_reqs.append(n_req)
             block_start.append(len(flat))
             flat.extend(blocks[: math.ceil(length / self.block_size)])
-            splits = self._splits(length, base_programs[bm])
+            splits = self._splits(length, base_programs[bm], n_req * g, bm)
             span = math.ceil(math.ceil(length / splits) / self.block_n) * self.block_n
             ranges = [(s, min(s + span, length)) for s in range(0, length, span)]
             rows = n_req * g
@@ -457,6 +506,7 @@ class CascadePlan:
             int(self.per_token),
             self.task_programs,
             self.merge_programs,
+            self.prefix_min_block_m,
         ]
 
 
@@ -478,7 +528,7 @@ def _cascade_op(
     counts, merge_start, merge_end, indices = plan_tensors[15:19]
     part_o, part_lse = workspace
     block_size, group, max_tasks, max_rows, prefix_bm, suffix_bm, block_n, per_token = settings[:8]
-    task_programs, merge_programs = settings[8:10]
+    task_programs, merge_programs, prefix_min_bm = settings[8:11]
     common = {
         "index": index,
         "perm": perm,
@@ -502,6 +552,7 @@ def _cascade_op(
         tasks=prefix_tasks,  # type: ignore[arg-type]
         num_tasks=counts[0:1],
         block_m=prefix_bm,
+        min_block_m=prefix_min_bm,
         num_warps=PREFIX_WARPS,
         num_stages=PREFIX_STAGES,
         **common,  # type: ignore[arg-type]

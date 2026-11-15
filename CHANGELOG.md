@@ -57,3 +57,15 @@ passed on the released source, with the torch and Triton versions of that run.
   separately. With both counted together, a batch with many suffixes left its
   prefix unsplit: batch 128, 32,768-token prefix, 128-token suffixes took
   3.3 ms per layer on an L4 and now takes 1.8 ms.
+- A prefix task of at most 64 or 32 query rows runs in a 64- or 32-row tile
+  inside the same launch (`CascadePlan(prefix_min_block_m=...)`, default a
+  quarter of the prefix tile). On an L4, groups of 17 to 32 rows (Llama 3.1 8B
+  at batch 8) take up to 17% less time.
+- Split-K chooses the number of token ranges per item that best fills whole
+  rounds of the programs that run at once (one prefix program per SM, two
+  suffix programs per SM by default: `prefix_programs_per_sm`,
+  `programs_per_sm`), and the shortest range is 4 tokens per query row of the
+  item's tile, between 128 and `min_split_tokens` (512). On an L4 over batch
+  1-128 and prefixes of 512-32,768 tokens this takes 0.935x the time of the
+  earlier rule (geometric mean), 0.72x at best and 1.06x at worst; batch 1
+  with a 512-token prefix takes 23.6 us per layer instead of 31.7.

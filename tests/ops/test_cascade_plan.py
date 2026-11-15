@@ -424,14 +424,45 @@ def test_small_groups_run_in_suffix_tiles_and_both_planners_agree(small_item_row
     assert torch.equal(device_lse, host_lse)
 
 
+@pytest.mark.parametrize(("tokens_per_row", "prefix_tasks"), [(1, 4), (0, 8)])
+def test_items_with_fewer_rows_get_shorter_ranges_and_both_planners_agree(
+    tokens_per_row: int, prefix_tasks: int
+) -> None:
+    # Six requests share 32 KV blocks (24 rows: the prefix launch), two share
+    # another 32 (8 rows: the suffix launch); 128-token prefixes, 16-token key
+    # tiles. The shortest range is max(4, tokens_per_row · rows), capped at 64:
+    # 24 tokens for the 24-row group gives ceil(128 / 24) = 6 ranges, rounded to
+    # whole key tiles: 4 ranges of 32 tokens; 4 tokens gives 16 ranges, rounded:
+    # 8 of 16 tokens.
+    a, b = list(range(1, 33)), list(range(33, 65))
+    rows = [[*a, 70 + r] for r in range(6)] + [[*b, 80 + r] for r in range(2)]
+    batch = explicit_batch(rows, [32 * 4 + 3] * 8, 4)
+    setup = build(batch)
+    plan = new_plan(setup, batch, num_sms=64, min_split_tokens=64, block_n=16)
+    plan.min_split_floor, plan.split_tokens_per_row = 4, tokens_per_row
+    plan_device(plan, setup)
+    _, groups = found_groups(plan)
+    assert sorted(g.rows for g in groups) == [2, 6]
+    assert int(plan.counts[0]) == prefix_tasks
+    device_out, device_lse = attend(setup, plan)
+    check(setup, device_out, device_lse)
+    device_counts = plan.counts.clone()
+    host_update(plan, batch, groups)
+    assert torch.equal(plan.counts[:2], device_counts[:2])
+    host_out, host_lse = attend(setup, plan)
+    assert torch.equal(device_out, host_out)
+    assert torch.equal(device_lse, host_lse)
+
+
 def test_split_k_falls_back_to_one_range_when_parts_do_not_fit() -> None:
     shared = list(range(1, 13))
     batch = explicit_batch([[*shared, 13], [*shared, 14], list(range(15, 27))], [52, 50, 48], 4)
     setup = build(batch)
     rows = 3 * setup.q.shape[1]
-    roomy = new_plan(setup, batch, num_sms=64, min_split_tokens=4)
+    # 16-token key tiles, so 48-52 tokens can split on a GPU too (its default is 64).
+    roomy = new_plan(setup, batch, num_sms=64, min_split_tokens=4, block_n=16)
     plan_device(roomy, setup)
-    tight = new_plan(setup, batch, num_sms=64, min_split_tokens=4, max_parts=2 * rows)
+    tight = new_plan(setup, batch, num_sms=64, min_split_tokens=4, max_parts=2 * rows, block_n=16)
     plan_device(tight, setup)
     assert int(roomy.item_info[1, : int(roomy.counts[4])].max()) > 1, "roomy plan should split"
     assert int(tight.item_info[1, : int(tight.counts[4])].max()) == 1
@@ -619,3 +650,27 @@ def test_planning_and_attention_capture_in_one_cuda_graph() -> None:
         graph.replay()
         torch.cuda.synchronize()
         check(Setup(q, k, v, s.index, s.requests), out, lse)
+
+
+@pytest.mark.parametrize(
+    ("length", "base_programs", "rows", "block_m", "splits"),
+    [
+        # 32 prefix programs, 58 fit at once: 9 ranges make 288 programs in 5
+        # rounds, 5/9 of a 1-range round each; 16 ranges need 9 rounds (9/16).
+        (32768, 32, 512, 128, 9),
+        # A 64-row group: ranges of at least 256 tokens, so at most 8; 7 ranges
+        # fill one round, 8 need two.
+        (2048, 8, 64, 128, 7),
+        # A 4-row suffix-launch item: ranges of at least 128 tokens, 116 programs fit.
+        (512, 8, 4, 16, 4),
+        # 580 programs fill 10 rounds exactly; more ranges only tie: one range.
+        (32768, 580, 512, 128, 1),
+    ],
+)
+def test_split_k_picks_the_range_count_that_fills_whole_rounds(
+    length: int, base_programs: int, rows: int, block_m: int, splits: int
+) -> None:
+    batch = explicit_batch([[1]], [4], 4)
+    setup = build(batch)
+    plan = new_plan(setup, batch, num_sms=58)
+    assert plan._splits(length, base_programs, rows, block_m) == splits
