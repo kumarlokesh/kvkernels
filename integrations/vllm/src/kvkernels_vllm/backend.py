@@ -152,6 +152,13 @@ class KvkernelsMetadataBuilder(TritonAttentionMetadataBuilder):
         )
 
 
+def _kv_scales(layer: torch.nn.Module) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+    """The layer's K and V scales for an fp8 cache: one-element fp32 tensors."""
+    scales = (getattr(layer, "_k_scale", None), getattr(layer, "_v_scale", None))
+    k_scale, v_scale = (t if isinstance(t, torch.Tensor) else None for t in scales)
+    return k_scale, v_scale
+
+
 class KvkernelsAttentionImpl(TritonAttentionImpl):
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
@@ -192,6 +199,7 @@ class KvkernelsAttentionImpl(TritonAttentionImpl):
         if n:
             calls.decode += 1
             assert attn_metadata.plan is not None
+            k_scale, v_scale = _kv_scales(layer)
             q = query[:n].view(n, self.num_heads, self.head_size)
             out = output[:n].view(n, self.num_heads, self.head_size)
             check = attn_metadata.decode_check
@@ -208,6 +216,8 @@ class KvkernelsAttentionImpl(TritonAttentionImpl):
                 head_size=self.head_size,
                 scale=self.scale,
                 lse_out=lse,
+                k_scale=k_scale,
+                v_scale=v_scale,
             )
             if check is not None:
                 assert lse is not None
@@ -223,6 +233,8 @@ class KvkernelsAttentionImpl(TritonAttentionImpl):
                     engine_out,
                     head_size=self.head_size,
                     scale=self.scale,
+                    k_scale=k_scale,
+                    v_scale=v_scale,
                 )
                 calls.checked += 1
         if attn_metadata.prefill is not None:
@@ -234,7 +246,13 @@ class KvkernelsAttentionImpl(TritonAttentionImpl):
 
 class KvkernelsAttentionBackend(TritonAttentionBackend):
     supported_dtypes: ClassVar[list[torch.dtype]] = [torch.float16, torch.bfloat16]
-    supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = ["auto", "float16", "bfloat16"]
+    supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = [
+        "auto",
+        "float16",
+        "bfloat16",
+        "fp8",
+        "fp8_e4m3",
+    ]
 
     @staticmethod
     def get_name() -> str:

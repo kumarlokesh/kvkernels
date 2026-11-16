@@ -29,12 +29,18 @@ from kvkernels.tolerance import assert_close
 
 HEAD_SIZES = (64, 128)
 MAX_GQA_GROUP = 16
-KV_DTYPES = ("auto", "float16", "bfloat16")
+# An fp8 cache: e4m3 bytes, one K and one V scale per layer (vLLM's default fp8).
+KV_DTYPES = ("auto", "float16", "bfloat16", "fp8", "fp8_e4m3")
 NUM_BLOCKS_UNCHECKED = 2**31 - 1  # the host plan's block-id check is never used here
 
 
 def kv_views(kv_cache: torch.Tensor, head_size: int) -> tuple[torch.Tensor, torch.Tensor]:
-    """K and V of one layer as [blocks, block_size, kv_heads, head_size] views."""
+    """K and V of one layer as [blocks, block_size, kv_heads, head_size] views.
+
+    vLLM stores an fp8 cache as uint8 bytes; the views are float8_e4m3fn.
+    """
+    if kv_cache.dtype == torch.uint8:
+        kv_cache = kv_cache.view(torch.float8_e4m3fn)
     kv = kv_cache.transpose(1, 2)
     return kv[..., :head_size], kv[..., head_size : 2 * head_size]
 
@@ -109,13 +115,20 @@ def decode(
     head_size: int,
     scale: float,
     lse_out: torch.Tensor | None = None,
+    k_scale: torch.Tensor | None = None,
+    v_scale: torch.Tensor | None = None,
 ) -> None:
     """Attention for the decode rows the plan was filled for.
 
     query, out: [rows, heads, head_size]; lse_out, if given: [rows, heads], fp32.
+    k_scale, v_scale: the layer's scales, read when the cache is fp8.
     """
     k, v = kv_views(kv_cache, head_size)
-    cascade_decode_attention(query, k, v, plan, out, lse_out, sm_scale=scale)
+    if k.dtype != torch.float8_e4m3fn:
+        k_scale = v_scale = None
+    cascade_decode_attention(
+        query, k, v, plan, out, lse_out, sm_scale=scale, k_scale=k_scale, v_scale=v_scale
+    )
 
 
 def check_decode(
@@ -129,6 +142,8 @@ def check_decode(
     *,
     head_size: int,
     scale: float,
+    k_scale: torch.Tensor | None = None,
+    v_scale: torch.Tensor | None = None,
 ) -> None:
     """Fail unless the cascade is as close to fp32 as vLLM's own kernel, within the tolerance rule.
 
@@ -138,6 +153,11 @@ def check_decode(
     table to the host, so it runs only in eager mode.
     """
     k, v = kv_views(kv_cache, head_size)
+    if k.dtype == torch.float8_e4m3fn:
+        # The references read the dequantized values, in the query's dtype.
+        assert k_scale is not None and v_scale is not None
+        k = (k.float() * k_scale.float()).to(query.dtype)
+        v = (v.float() * v_scale.float()).to(query.dtype)
     block_size = k.shape[1]
     lens = seq_lens.tolist()
     rows = block_table.tolist()

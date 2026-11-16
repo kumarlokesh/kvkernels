@@ -120,12 +120,12 @@ def test_unsupported_lists_every_reason() -> None:
         **ok,
         "head_size": 96,
         "num_kv_heads": 1,
-        "kv_cache_dtype": "fp8",
+        "kv_cache_dtype": "fp8_e5m2",
         "sliding_window": True,
     }
     reasons = unsupported(**bad)  # type: ignore[arg-type]
     assert len(reasons) == 4
-    assert any("96" in r for r in reasons) and any("fp8" in r for r in reasons)
+    assert any("96" in r for r in reasons) and any("fp8_e5m2" in r for r in reasons)
 
 
 def test_a_plan_larger_than_one_sorting_program_is_refused() -> None:

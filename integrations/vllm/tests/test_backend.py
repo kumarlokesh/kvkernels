@@ -44,7 +44,8 @@ def test_the_backend_declares_only_what_the_cascade_supports() -> None:
     assert not B.supports_attn_type(AttentionType.ENCODER_ONLY)
     assert not B.supports_sliding_window() and not B.supports_sink()
     assert not B.supports_dtype(torch.float32)
-    assert not B.supports_kv_cache_dtype("fp8")
+    assert B.supports_kv_cache_dtype("fp8") and B.supports_kv_cache_dtype("fp8_e4m3")
+    assert not B.supports_kv_cache_dtype("fp8_e5m2")
     assert B.get_builder_cls()._cudagraph_support == (
         AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
     )
@@ -235,13 +236,18 @@ SYSTEM = "You are a careful assistant. Answer in one short sentence. " * 12
 
 
 @pytest.mark.gpu
+@pytest.mark.parametrize("kv_cache_dtype", ["auto", "fp8"])
 def test_every_decode_call_matches_vllm_and_fp32_in_a_server_step(
-    monkeypatch: pytest.MonkeyPatch,
+    kv_cache_dtype: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     from vllm import LLM, SamplingParams
 
+    import kvkernels.ops.cascade
+
     monkeypatch.setenv("KVKERNELS_VLLM_CHECK", "1")
     monkeypatch.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
+    # The system prompt is about 150 tokens; group it despite the 512-token default.
+    monkeypatch.setattr(kvkernels.ops.cascade, "MIN_SHARED_TOKENS", 64)
     register()
     dtype = _model_dtype()
     llm = LLM(
@@ -251,6 +257,7 @@ def test_every_decode_call_matches_vllm_and_fp32_in_a_server_step(
         dtype=dtype,
         max_model_len=2048,
         gpu_memory_utilization=0.5,
+        kv_cache_dtype=kv_cache_dtype,
     )
     prompts = [f"{SYSTEM}\nQuestion {i}: name a prime number above {10 * i}." for i in range(12)]
     prompts += ["Count from one to five.", "Name a colour."]  # no shared prefix
@@ -265,9 +272,12 @@ def test_every_decode_call_matches_vllm_and_fp32_in_a_server_step(
 def test_decode_batches_run_in_full_cuda_graphs(monkeypatch: pytest.MonkeyPatch) -> None:
     from vllm import LLM, SamplingParams
 
+    import kvkernels.ops.cascade
+
     if os.environ.get("KVKERNELS_VLLM_CHECK") == "1":
         pytest.skip("the check copies to the host, which a CUDA graph cannot capture")
     monkeypatch.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
+    monkeypatch.setattr(kvkernels.ops.cascade, "MIN_SHARED_TOKENS", 64)
     register()
     dtype = _model_dtype()
     llm = LLM(
