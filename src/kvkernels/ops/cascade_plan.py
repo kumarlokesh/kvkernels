@@ -193,6 +193,7 @@ def _ranges(  # type: ignore[no-untyped-def]
     length,
     rows,
     item_rows,
+    budget_rows,
     base_programs,
     allow_split,
     target,
@@ -211,10 +212,14 @@ def _ranges(  # type: ignore[no-untyped-def]
         splits = tl.cdiv(length, min_split)
     else:
         min_tokens = tl.minimum(min_split, tl.maximum(split_floor, split_per_row * rows))
-        # Partial results cost 8 bytes per row and head dimension per range: keep
-        # ranges at least split_per_row tokens per row of the whole item.
-        min_tokens = tl.maximum(min_tokens, split_per_row * item_rows)
         cap = tl.minimum(tl.maximum(tl.cdiv(length, min_tokens), 1), MAX_SPLITS)
+        # The item's partial results (8 bytes per row and head dimension per range)
+        # are no larger than its K and V, or fit in a share of L2: ranges times rows
+        # at most budget_rows.
+        item_rows = tl.maximum(item_rows, 1)
+        by_kv = length // tl.maximum(split_per_row * item_rows, 1)
+        by_bytes = tl.maximum(by_kv, budget_rows // item_rows)
+        cap = tl.minimum(cap, tl.maximum(by_bytes, 1))
         # The s whose programs fill the launch's rounds best: ceil(base · s / R) / s
         # smallest, compared as ceil(base · s / R) · best_s < best_rounds · s.
         base = tl.maximum(base_programs, 1)
@@ -298,6 +303,7 @@ def _items_kernel(  # type: ignore[no-untyped-def]
     kv_heads,
     q_heads,
     small_rows,
+    part_budget_rows,
     GROUP: tl.constexpr,
     MAX_LEVELS: tl.constexpr,
     PREFIX_BM: tl.constexpr,
@@ -383,6 +389,7 @@ def _items_kernel(  # type: ignore[no-untyped-def]
         group_len,
         g_tile_rows,
         group_rows,
+        part_budget_rows,
         g_base,
         True,
         g_target,
@@ -397,6 +404,7 @@ def _items_kernel(  # type: ignore[no-untyped-def]
         suffix_len,
         s_tile_rows,
         rows_per_request,
+        part_budget_rows,
         s_base,
         True,
         suffix_target,
@@ -419,6 +427,7 @@ def _items_kernel(  # type: ignore[no-untyped-def]
         group_len,
         g_tile_rows,
         group_rows,
+        part_budget_rows,
         g_base,
         fits,
         g_target,
@@ -433,6 +442,7 @@ def _items_kernel(  # type: ignore[no-untyped-def]
         suffix_len,
         s_tile_rows,
         rows_per_request,
+        part_budget_rows,
         s_base,
         fits,
         suffix_target,
@@ -683,6 +693,7 @@ def planning_launches(
             plan.num_kv_heads,
             plan.num_q_heads,
             plan.small_item_rows,
+            plan.part_budget_rows,
             GROUP=plan.group,
             MAX_LEVELS=plan.max_levels,
             PREFIX_BM=plan.prefix_block_m,

@@ -175,6 +175,9 @@ class KvkernelsAttentionImpl(TritonAttentionImpl):
         )
         if reasons:
             raise ValueError("the kvkernels backend does not support: " + "; ".join(reasons))
+        # With an fp8 cache vLLM would quantize the query to fp8 for a backend that
+        # accepts it; the cascade takes fp16 or bf16 queries and scales the fp8 KV.
+        self.supports_quant_query_input = False
 
     def fused_output_quant_supported(self, quant_key: Any) -> bool:
         return False

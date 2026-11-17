@@ -1,0 +1,258 @@
+{
+  "created_utc": "2026-11-17T19:50:01Z",
+  "env": {
+    "cuda_version": "12.6",
+    "driver_version": "580.178.04",
+    "gpu_name": "NVIDIA L4",
+    "gpu_slug": "l4",
+    "hostname_hash": "60df3bbf7a60f9efc1e713351c02e4451c342eb941639adca9028fe4909c3a1d",
+    "mem_clock_mhz": 6251,
+    "sm_clock_mhz": 2040,
+    "torch_version": "2.14.1+cu126",
+    "triton_version": "3.8.0"
+  },
+  "git_sha": "dirty-d2c71359b5109c5531ae0337d4c87356c11bec75",
+  "measurements": [
+    {
+      "impl": "flashinfer_decode",
+      "kernels": 1,
+      "model_bytes": 83886080,
+      "params": {
+        "batch": 32,
+        "block": 16,
+        "dtype": "float16",
+        "groups": 1,
+        "head_dim": 128,
+        "kv_heads": 8,
+        "layout": "vllm_LBNHC",
+        "model": "llama-3.1-8b",
+        "prefix_len": 4096,
+        "q_heads": 32,
+        "suffix_len": 512
+      },
+      "read_bytes": 97453824,
+      "write_bytes": 1821056
+    },
+    {
+      "impl": "kvkernels_per_request",
+      "kernels": 3,
+      "model_bytes": 83886080,
+      "params": {
+        "batch": 32,
+        "block": 16,
+        "dtype": "float16",
+        "groups": 1,
+        "head_dim": 128,
+        "kv_heads": 8,
+        "layout": "vllm_LBNHC",
+        "model": "llama-3.1-8b",
+        "prefix_len": 4096,
+        "q_heads": 32,
+        "suffix_len": 512
+      },
+      "read_bytes": 97770752,
+      "write_bytes": 312576
+    },
+    {
+      "impl": "kvkernels",
+      "kernels": 3,
+      "model_bytes": 83886080,
+      "params": {
+        "batch": 32,
+        "block": 16,
+        "dtype": "float16",
+        "groups": 1,
+        "head_dim": 128,
+        "kv_heads": 8,
+        "layout": "vllm_LBNHC",
+        "model": "llama-3.1-8b",
+        "prefix_len": 4096,
+        "q_heads": 32,
+        "suffix_len": 512
+      },
+      "read_bytes": 105032576,
+      "write_bytes": 23552
+    },
+    {
+      "impl": "flashinfer_decode",
+      "kernels": 1,
+      "model_bytes": 201326592,
+      "params": {
+        "batch": 32,
+        "block": 16,
+        "dtype": "float16",
+        "groups": 1,
+        "head_dim": 128,
+        "kv_heads": 8,
+        "layout": "vllm_LBNHC",
+        "model": "llama-3.1-8b",
+        "prefix_len": 32768,
+        "q_heads": 32,
+        "suffix_len": 512
+      },
+      "read_bytes": 254644480,
+      "write_bytes": 2006016
+    },
+    {
+      "impl": "kvkernels_per_request",
+      "kernels": 3,
+      "model_bytes": 201326592,
+      "params": {
+        "batch": 32,
+        "block": 16,
+        "dtype": "float16",
+        "groups": 1,
+        "head_dim": 128,
+        "kv_heads": 8,
+        "layout": "vllm_LBNHC",
+        "model": "llama-3.1-8b",
+        "prefix_len": 32768,
+        "q_heads": 32,
+        "suffix_len": 512
+      },
+      "read_bytes": 247460608,
+      "write_bytes": 571264
+    },
+    {
+      "impl": "kvkernels",
+      "kernels": 3,
+      "model_bytes": 201326592,
+      "params": {
+        "batch": 32,
+        "block": 16,
+        "dtype": "float16",
+        "groups": 1,
+        "head_dim": 128,
+        "kv_heads": 8,
+        "layout": "vllm_LBNHC",
+        "model": "llama-3.1-8b",
+        "prefix_len": 32768,
+        "q_heads": 32,
+        "suffix_len": 512
+      },
+      "read_bytes": 239118848,
+      "write_bytes": 1925248
+    },
+    {
+      "impl": "flashinfer_decode",
+      "kernels": 1,
+      "model_bytes": 285212672,
+      "params": {
+        "batch": 128,
+        "block": 16,
+        "dtype": "float16",
+        "groups": 1,
+        "head_dim": 128,
+        "kv_heads": 8,
+        "layout": "vllm_LBNHC",
+        "model": "llama-3.1-8b",
+        "prefix_len": 4096,
+        "q_heads": 32,
+        "suffix_len": 512
+      },
+      "read_bytes": 332698752,
+      "write_bytes": 2779136
+    },
+    {
+      "impl": "kvkernels_per_request",
+      "kernels": 3,
+      "model_bytes": 285212672,
+      "params": {
+        "batch": 128,
+        "block": 16,
+        "dtype": "float16",
+        "groups": 1,
+        "head_dim": 128,
+        "kv_heads": 8,
+        "layout": "vllm_LBNHC",
+        "model": "llama-3.1-8b",
+        "prefix_len": 4096,
+        "q_heads": 32,
+        "suffix_len": 512
+      },
+      "read_bytes": 346011392,
+      "write_bytes": 4107392
+    },
+    {
+      "impl": "kvkernels",
+      "kernels": 3,
+      "model_bytes": 285212672,
+      "params": {
+        "batch": 128,
+        "block": 16,
+        "dtype": "float16",
+        "groups": 1,
+        "head_dim": 128,
+        "kv_heads": 8,
+        "layout": "vllm_LBNHC",
+        "model": "llama-3.1-8b",
+        "prefix_len": 4096,
+        "q_heads": 32,
+        "suffix_len": 512
+      },
+      "read_bytes": 338582528,
+      "write_bytes": 1755136
+    },
+    {
+      "impl": "flashinfer_decode",
+      "kernels": 1,
+      "model_bytes": 402653184,
+      "params": {
+        "batch": 128,
+        "block": 16,
+        "dtype": "float16",
+        "groups": 1,
+        "head_dim": 128,
+        "kv_heads": 8,
+        "layout": "vllm_LBNHC",
+        "model": "llama-3.1-8b",
+        "prefix_len": 32768,
+        "q_heads": 32,
+        "suffix_len": 512
+      },
+      "read_bytes": 550123776,
+      "write_bytes": 2959616
+    },
+    {
+      "impl": "kvkernels_per_request",
+      "kernels": 3,
+      "model_bytes": 402653184,
+      "params": {
+        "batch": 128,
+        "block": 16,
+        "dtype": "float16",
+        "groups": 1,
+        "head_dim": 128,
+        "kv_heads": 8,
+        "layout": "vllm_LBNHC",
+        "model": "llama-3.1-8b",
+        "prefix_len": 32768,
+        "q_heads": 32,
+        "suffix_len": 512
+      },
+      "read_bytes": 633371392,
+      "write_bytes": 4462720
+    },
+    {
+      "impl": "kvkernels",
+      "kernels": 3,
+      "model_bytes": 402653184,
+      "params": {
+        "batch": 128,
+        "block": 16,
+        "dtype": "float16",
+        "groups": 1,
+        "head_dim": 128,
+        "kv_heads": 8,
+        "layout": "vllm_LBNHC",
+        "model": "llama-3.1-8b",
+        "prefix_len": 32768,
+        "q_heads": 32,
+        "suffix_len": 512
+      },
+      "read_bytes": 494757632,
+      "write_bytes": 12523904
+    }
+  ],
+  "suite": "cascade-dram"
+}

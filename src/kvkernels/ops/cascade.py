@@ -95,6 +95,11 @@ DEFAULT_LEVELS = 4
 # Split-K ranges are at least SPLIT_TOKENS_PER_ROW tokens per query row of the
 # item's tile, and at least MIN_SPLIT_FLOOR tokens, up to min_split_tokens.
 SPLIT_TOKENS_PER_ROW = 2
+# An item's split-K partial results may take at most this share of L2: on an L4
+# (48 MB), 4,096-token ranges for a 1,024-row item spilled 75 MB of partial
+# results to device memory and took 1.5x the time of 2 ranges.
+PARTIAL_L2_SHARE = 3
+DEFAULT_L2_BYTES = 48 << 20  # an L4's L2, for plans without a CUDA device (the interpreter)
 MIN_SPLIT_FLOOR = 128
 # Shortest shared prefix that forms a group. On an L4 (48 MB of L2), grouping
 # requests that share 16-256 tokens took 0.98-1.07x the time of reading the
@@ -247,6 +252,17 @@ class CascadePlan:
         self.min_split_tokens = min_split_tokens
         self.split_tokens_per_row = SPLIT_TOKENS_PER_ROW
         self.min_split_floor = MIN_SPLIT_FLOOR
+        # Split-K keeps each item's partial results within a share of L2: rows of
+        # an item times its ranges at most part_budget_rows. Each row costs
+        # kv_heads · head_dim · 8 bytes per range (fp32 output, written and read).
+        l2_bytes = (
+            torch.cuda.get_device_properties(device).L2_cache_size
+            if device.type == "cuda"
+            else DEFAULT_L2_BYTES
+        )
+        self.part_budget_rows = max(
+            1, l2_bytes // PARTIAL_L2_SHARE // (num_kv_heads * head_dim * 8)
+        )
         self.prefix_block_m = prefix_block_m
         self.prefix_min_block_m = prefix_min_block_m
         self.suffix_block_m = suffix_block_m
@@ -388,11 +404,15 @@ class CascadePlan:
         # The ranges whose programs fill the launch's rounds best: time is about
         # (rounds of programs) x (tokens per range) = ceil(base · s / R) / s.
         # Each range also writes, and the merge reads, an fp32 partial result per
-        # row: 8 bytes per row and head dimension against 4 per token of K and V.
-        # Ranges of at least 2 tokens per row of the item keep that traffic below
-        # the KV's.
-        shortest = max(self.min_range_tokens(min(rows, block_m)), self.split_tokens_per_row * rows)
-        cap = max(1, min(MAX_SPLITS, math.ceil(length / shortest)))
+        # row: 8 bytes per row and head dimension, against 4 per token of K and V.
+        # s ranges are allowed when the item's partial results are no larger than
+        # its K and V (ranges of at least 2 tokens per row), or fit in a share of
+        # L2 (s · rows at most part_budget_rows).
+        rows = max(rows, 1)
+        by_kv = length // max(self.split_tokens_per_row * rows, 1)
+        by_bytes = max(by_kv, self.part_budget_rows // rows)
+        cap = math.ceil(length / self.min_range_tokens(min(rows, block_m)))
+        cap = max(1, min(MAX_SPLITS, cap, by_bytes))
         base = max(base_programs, 1)
         best_s, best_rounds = 1, math.ceil(base / resident)
         for s in range(2, cap + 1):

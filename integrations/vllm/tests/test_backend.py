@@ -60,6 +60,14 @@ def test_the_impl_refuses_a_sliding_window() -> None:
         KvkernelsAttentionImpl(*args, 4096, "auto")
 
 
+def test_the_impl_takes_16_bit_queries_over_an_fp8_cache() -> None:
+    from kvkernels_vllm.backend import KvkernelsAttentionImpl
+
+    # vLLM quantizes the query to fp8 only for a backend that says it accepts it.
+    impl = KvkernelsAttentionImpl(32, 128, 128**-0.5, 8, None, None, "fp8")
+    assert impl.supports_quant_query_input is False
+
+
 def test_rows_slices_the_prefill_requests_out_of_a_mixed_batch() -> None:
     from vllm.v1.attention.backends.triton_attn import TritonAttentionMetadata
 

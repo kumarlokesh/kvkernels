@@ -100,5 +100,7 @@ passed on the released source, with the torch and Triton versions of that run.
 - Planning on the GPU runs three launches instead of four: one launch finds the
   prefix tree by sorting and binary search, and the fill launch splits each
   item's tasks and merge entries over 8 programs.
-- Split-K ranges hold at least 2 tokens per query row of the whole item, since
-  each range writes and the merge reads a partial result per row.
+- Split-K bounds each item's partial results: s ranges of an item are allowed
+  when its partial results are no larger than its K and V, or fit in a third of
+  L2. A 4,096-token prefix shared by 64 requests with 4 query tokens each was
+  split into 9 ranges whose partial results (75 MB) left an L4's 48 MB L2.

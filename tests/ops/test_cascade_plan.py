@@ -671,10 +671,6 @@ def test_planning_and_attention_capture_in_one_cuda_graph() -> None:
         # round better in more ranges, but the merge would read more partial results.
         (32768, 600, 512, 128, 1),
         (32768, 116, 512, 128, 1),
-        # An item of 1,024 rows (64 requests, 4 query tokens, GQA group 4): each
-        # range writes and the merge reads 8 bytes per row and head dimension, so
-        # ranges hold at least 2 · 1,024 tokens: 2 ranges of a 4,096-token node.
-        (4096, 32, 1024, 128, 2),
     ],
 )
 def test_split_k_picks_the_range_count_that_fills_whole_rounds(
@@ -684,3 +680,18 @@ def test_split_k_picks_the_range_count_that_fills_whole_rounds(
     setup = build(batch)
     plan = new_plan(setup, batch, num_sms=58)
     assert plan._splits(length, base_programs, rows, block_m) == splits
+
+
+def test_split_k_bounds_an_items_partial_results() -> None:
+    # A 1,024-row item (64 requests, 4 query tokens, GQA group 4) over 4,096
+    # tokens: partial results no larger than its K and V allow 2 ranges, and an L2
+    # share of 2,048 rows allows 2. 7 would fill the rounds best without the bound.
+    batch = explicit_batch([[1]], [4], 4)
+    plan = new_plan(build(batch), batch, num_sms=58)
+    assert plan._splits(4096, 32, 1024, 128) == 7
+    plan.part_budget_rows = 2048
+    assert plan._splits(4096, 32, 1024, 128) == 2
+    # A long prefix: K and V outweigh 7 ranges of partial results, as before.
+    assert plan._splits(32768, 32, 512, 128) == 7
+    # A short one: 2 ranges of 256 rows fit the L2 share although they outweigh K and V.
+    assert plan._splits(512, 16, 256, 128) == 2
