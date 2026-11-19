@@ -104,3 +104,13 @@ passed on the released source, with the torch and Triton versions of that run.
   when its partial results are no larger than its K and V, or fit in a third of
   L2. A 4,096-token prefix shared by 64 requests with 4 query tokens each was
   split into 9 ranges whose partial results (75 MB) left an L4's 48 MB L2.
+- The cascade's attention kernel requires q, K and V with a contiguous head
+  dimension (every supported layout has one) and loads K and V 16 bytes at a
+  time; with the stride an argument it loaded 2 bytes at a time. On an L4 the
+  prefix pass issues 43% fewer instructions and long prefixes take 2-3% less
+  time.
+- GPU planning runs its tree and items launches with 8 warps for plans of 129
+  to 2,048 requests (4 warps up to 512 before). On an L4, planning a batch of
+  256 takes 48 us instead of 51, a three-level tree at batch 256 takes 70 us
+  instead of 77, and a batch of 512 takes 80 us instead of 96.
+

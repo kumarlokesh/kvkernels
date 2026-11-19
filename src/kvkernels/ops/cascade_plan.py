@@ -619,7 +619,10 @@ FILL_PROGRAMS = 8  # programs per item in the fill launch
 
 
 def _warps(block: int) -> int:
-    return 4 if block <= 512 else 8 if block <= 2048 else 16
+    # Warps for the one-program tree and items launches, by the request tile.
+    # Measured on the L4: 8 warps cut planning at batch 512 from 96 to 80 µs and
+    # cost 2-6 µs at batch 128 and below.
+    return 4 if block <= 128 else 8 if block <= 2048 else 16
 
 
 Launch = Callable[[], None]

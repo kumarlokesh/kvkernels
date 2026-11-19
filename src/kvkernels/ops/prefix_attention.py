@@ -73,15 +73,12 @@ def _task(  # type: ignore[no-untyped-def]
     part_base,
     stride_qr,
     stride_qh,
-    stride_qd,
     stride_kb,
     stride_ks,
     stride_kh,
-    stride_kd,
     stride_vb,
     stride_vs,
     stride_vh,
-    stride_vd,
     scale_log2e,
     out_scale,
     block_size,
@@ -113,7 +110,7 @@ def _task(  # type: ignore[no-untyped-def]
         q_ptr
         + (request * QUERY_TOKENS + token)[:, None].to(tl.int64) * stride_qr
         + q_head[:, None] * stride_qh
-        + dims[None, :] * stride_qd,
+        + dims[None, :],
         mask=row_ok[:, None],
         other=0.0,
     )
@@ -138,7 +135,7 @@ def _task(  # type: ignore[no-untyped-def]
             + block[None, :] * stride_kb
             + slot[None, :] * stride_ks
             + kv_head * stride_kh
-            + dims[:, None] * stride_kd,
+            + dims[:, None],
             mask=tok_ok[None, :],
             other=0.0,
         ).to(q.dtype)  # an fp8 tile converts exactly; its scale is in scale_log2e
@@ -162,7 +159,7 @@ def _task(  # type: ignore[no-untyped-def]
             + block[:, None] * stride_vb
             + slot[:, None] * stride_vs
             + kv_head * stride_vh
-            + dims[None, :] * stride_vd,
+            + dims[None, :],
             mask=tok_ok[:, None],
             other=0.0,
         ).to(q.dtype)  # an fp8 tile's scale is applied to the output, in out_scale
@@ -207,15 +204,12 @@ def _work_item_kernel(  # type: ignore[no-untyped-def]
     v_scale_ptr,
     stride_qr,
     stride_qh,
-    stride_qd,
     stride_kb,
     stride_ks,
     stride_kh,
-    stride_kd,
     stride_vb,
     stride_vs,
     stride_vh,
-    stride_vd,
     scale_log2e,
     block_size,
     GROUP: tl.constexpr,
@@ -273,15 +267,12 @@ def _work_item_kernel(  # type: ignore[no-untyped-def]
                 part_base,
                 stride_qr,
                 stride_qh,
-                stride_qd,
                 stride_kb,
                 stride_ks,
                 stride_kh,
-                stride_kd,
                 stride_vb,
                 stride_vs,
                 stride_vh,
-                stride_vd,
                 score_scale,
                 out_scale,
                 block_size,
@@ -313,15 +304,12 @@ def _work_item_kernel(  # type: ignore[no-untyped-def]
                     part_base,
                     stride_qr,
                     stride_qh,
-                    stride_qd,
                     stride_kb,
                     stride_ks,
                     stride_kh,
-                    stride_kd,
                     stride_vb,
                     stride_vs,
                     stride_vh,
-                    stride_vd,
                     score_scale,
                     out_scale,
                     block_size,
@@ -352,15 +340,12 @@ def _work_item_kernel(  # type: ignore[no-untyped-def]
                     part_base,
                     stride_qr,
                     stride_qh,
-                    stride_qd,
                     stride_kb,
                     stride_ks,
                     stride_kh,
-                    stride_kd,
                     stride_vb,
                     stride_vs,
                     stride_vh,
-                    stride_vd,
                     score_scale,
                     out_scale,
                     block_size,
@@ -392,15 +377,12 @@ def _work_item_kernel(  # type: ignore[no-untyped-def]
                     part_base,
                     stride_qr,
                     stride_qh,
-                    stride_qd,
                     stride_kb,
                     stride_ks,
                     stride_kh,
-                    stride_kd,
                     stride_vb,
                     stride_vs,
                     stride_vh,
-                    stride_vd,
                     score_scale,
                     out_scale,
                     block_size,
@@ -431,15 +413,12 @@ def _work_item_kernel(  # type: ignore[no-untyped-def]
                     part_base,
                     stride_qr,
                     stride_qh,
-                    stride_qd,
                     stride_kb,
                     stride_ks,
                     stride_kh,
-                    stride_kd,
                     stride_vb,
                     stride_vs,
                     stride_vh,
-                    stride_vd,
                     score_scale,
                     out_scale,
                     block_size,
@@ -470,15 +449,12 @@ def _work_item_kernel(  # type: ignore[no-untyped-def]
                     part_base,
                     stride_qr,
                     stride_qh,
-                    stride_qd,
                     stride_kb,
                     stride_ks,
                     stride_kh,
-                    stride_kd,
                     stride_vb,
                     stride_vs,
                     stride_vh,
-                    stride_vd,
                     score_scale,
                     out_scale,
                     block_size,
@@ -527,6 +503,10 @@ def attend(
     min_block_m, block_m // 2 or block_m // 4 (default block_m): a task of at most
     that many rows runs in a tile of that height instead of block_m.
     """
+    # The kernel reads head_dim as contiguous: with its stride a runtime argument,
+    # Triton cannot prove it is 1 and loads K and V 2 bytes at a time.
+    if q.stride(2) != 1 or k.stride(3) != 1 or v.stride(3) != 1:
+        raise ValueError("q, k and v need a contiguous head dimension (stride 1)")
     kv_fp8 = k.dtype == torch.float8_e4m3fn
     if kv_fp8 and (k_scale is None or v_scale is None):
         raise ValueError("an fp8 cache needs k_scale and v_scale")
@@ -557,9 +537,9 @@ def attend(
         part_lse,
         k_scale if kv_fp8 else part_lse,  # unread without fp8
         v_scale if kv_fp8 else part_lse,
-        *q.stride(),
-        *k.stride(),
-        *v.stride(),
+        *q.stride()[:2],
+        *k.stride()[:3],
+        *v.stride()[:3],
         sm_scale * LOG2E,
         block_size,
         GROUP=group,

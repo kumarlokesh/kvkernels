@@ -14,7 +14,8 @@ pytest.importorskip("triton")
 
 import torch
 
-from tests.ops.cascade_cases import INTERPRETING, make_case
+from kvkernels.ops.cascade import cascade_decode_attention
+from tests.ops.cascade_cases import INTERPRETING, make_case, make_plan
 from tests.ops.test_cascade import check, run
 
 pytestmark = pytest.mark.skipif(
@@ -70,3 +71,17 @@ def test_a_smallest_tile_that_is_not_a_half_or_quarter_is_rejected(min_block_m: 
 def test_a_prefix_spanning_many_key_tiles_with_split_ranges() -> None:
     case = make_case(group_lens=[(3, 150)], suffix_lens=[0, 0, 0], block_size=4)
     check(case, *run(case, num_sms=32, min_split_tokens=16))
+
+
+def test_a_head_dimension_that_is_not_contiguous_is_rejected() -> None:
+    # The kernel reads head_dim as contiguous, so that K and V load 16 bytes at a
+    # time; a view with another stride there must be refused, not misread.
+    case = make_case()
+    plan = make_plan(case)
+    strided = torch.empty(
+        (*case.k.shape[:3], 2 * case.k.shape[3]), dtype=case.k.dtype, device=case.k.device
+    )[..., ::2]
+    strided.copy_(case.k)
+    out = torch.empty_like(case.q)
+    with pytest.raises(ValueError, match="contiguous head dimension"):
+        cascade_decode_attention(case.q, strided, case.v, plan, out)

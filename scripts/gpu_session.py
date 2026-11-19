@@ -140,6 +140,14 @@ STEPS = (
         writes_results=True,
         needs=(*RESULT_TESTS, "test-vllm"),
     ),
+    Step(
+        "serving-fp8",
+        f"{VLLM_ENV}/bin/python -m bench.serving --gsm8k --kv-cache-dtype fp8"
+        " --backends TRITON_ATTN,CUSTOM"
+        f" --model ${{KVKERNELS_SERVING_MODEL:-{SERVING_MODEL}}}",
+        writes_results=True,
+        needs=(*RESULT_TESTS, "test-vllm"),
+    ),
 )
 STEP_NAMES = tuple(s.name for s in STEPS)
 

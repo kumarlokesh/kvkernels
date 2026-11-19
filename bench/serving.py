@@ -43,7 +43,7 @@ from typing import Any
 
 from bench.schema import EnvInfo, SchemaError, _build, utc_now
 
-SERVING_SCHEMA_VERSION = 1
+SERVING_SCHEMA_VERSION = 2  # 2 adds kv_cache_dtype; a version 1 file reads as "auto"
 ENGINE = "vllm"
 ENGINE_VERSION = "0.33.0"
 BACKENDS = ("FLASH_ATTN", "TRITON_ATTN", "CUSTOM")
@@ -146,6 +146,7 @@ class ServingResult:
     records: list[ServingRecord]
     agreement: list[AgreementRecord]
     accuracy: list[AccuracyRecord]
+    kv_cache_dtype: str  # vLLM's --kv-cache-dtype for every server of the run
 
 
 # --- commands ---------------------------------------------------------------------
@@ -157,7 +158,10 @@ def tool(name: str) -> str:
     return str(path) if path.exists() else name
 
 
-def serve_command(model: str, backend: str, port: int = PORT) -> list[str]:
+def serve_command(
+    model: str, backend: str, port: int = PORT, kv_cache_dtype: str = "auto"
+) -> list[str]:
+    cache = [] if kv_cache_dtype == "auto" else ["--kv-cache-dtype", kv_cache_dtype]
     return [
         tool("vllm"),
         "serve",
@@ -170,6 +174,7 @@ def serve_command(model: str, backend: str, port: int = PORT) -> list[str]:
         str(MAX_MODEL_LEN),
         "--seed",
         str(SEED),
+        *cache,
     ]
 
 
@@ -305,6 +310,8 @@ def write_result(result: ServingResult, root: Path = Path("results")) -> Path:
 
 def read_result(path: Path) -> ServingResult:
     data = json.loads(path.read_text())
+    if isinstance(data, dict) and data.get("schema_version") == 1:
+        data = {**data, "schema_version": SERVING_SCHEMA_VERSION, "kv_cache_dtype": "auto"}
     if not isinstance(data, dict) or data.get("schema_version") != SERVING_SCHEMA_VERSION:
         raise SchemaError(f"{path}: not a serving result of schema {SERVING_SCHEMA_VERSION}")
     result: ServingResult = _build(ServingResult, data, "result")
@@ -331,9 +338,10 @@ def wait_ready(port: int, server: subprocess.Popen[bytes], timeout_s: float = 18
 
 
 @contextlib.contextmanager
-def server(model: str, backend: str, log: Path) -> Iterator[None]:
+def server(model: str, backend: str, log: Path, kv_cache_dtype: str = "auto") -> Iterator[None]:
     with log.open("wb") as out:
-        proc = subprocess.Popen(serve_command(model, backend), stdout=out, stderr=subprocess.STDOUT)
+        command = serve_command(model, backend, kv_cache_dtype=kv_cache_dtype)
+        proc = subprocess.Popen(command, stdout=out, stderr=subprocess.STDOUT)
         try:
             wait_ready(PORT, proc)
             yield
@@ -352,15 +360,22 @@ def model_revision(model: str) -> str:
     return sha or "unknown"
 
 
-def run(model: str, *, gsm8k: bool, workdir: Path) -> ServingResult:
+def run(
+    model: str,
+    *,
+    gsm8k: bool,
+    workdir: Path,
+    backends: Sequence[str] = BACKENDS,
+    kv_cache_dtype: str = "auto",
+) -> ServingResult:
     from bench.env import collect
     from bench.harness import git_sha
 
     records: list[ServingRecord] = []
     texts: dict[tuple[str, str, int], list[str]] = {}
     accuracy: list[AccuracyRecord] = []
-    for backend in BACKENDS:
-        with server(model, backend, workdir / f"serve-{backend}.log"):
+    for backend in backends:
+        with server(model, backend, workdir / f"serve-{backend}.log", kv_cache_dtype):
             for workload in WORKLOADS:
                 warm = bench_command(
                     model,
@@ -413,8 +428,9 @@ def run(model: str, *, gsm8k: bool, workdir: Path) -> ServingResult:
         model_revision=model_revision(model),
         max_model_len=MAX_MODEL_LEN,
         records=records,
-        agreement=agreement(texts),
+        agreement=agreement(texts, reference=backends[0]),
         accuracy=accuracy,
+        kv_cache_dtype=kv_cache_dtype,
     )
 
 
@@ -423,14 +439,31 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--model", default="meta-llama/Llama-3.1-8B-Instruct")
     parser.add_argument("--gsm8k", action="store_true", help="also measure GSM8K accuracy")
     parser.add_argument("--results", type=Path, default=Path("results"))
+    parser.add_argument(
+        "--kv-cache-dtype", default="auto", help="vLLM's --kv-cache-dtype, for every server"
+    )
+    parser.add_argument(
+        "--backends",
+        default=",".join(BACKENDS),
+        help="comma-separated; the first is the reference for the agreement count",
+    )
     args = parser.parse_args(argv)
+    backends = args.backends.split(",")
+    if unknown := set(backends) - set(BACKENDS):
+        parser.error(f"unknown backends {sorted(unknown)}; choose from {BACKENDS}")
     import vllm
 
     if vllm.__version__ != ENGINE_VERSION:
         raise SystemExit(f"needs vllm {ENGINE_VERSION}, found {vllm.__version__}")
     workdir = Path(tempfile.mkdtemp(prefix="kvkernels-serving-"))
     print(f"server logs and raw benchmark files: {workdir}")
-    result = run(args.model, gsm8k=args.gsm8k, workdir=workdir)
+    result = run(
+        args.model,
+        gsm8k=args.gsm8k,
+        workdir=workdir,
+        backends=backends,
+        kv_cache_dtype=args.kv_cache_dtype,
+    )
     path = write_result(result, args.results)
     print(f"wrote {path}")
     return 0

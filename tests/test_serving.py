@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 
@@ -104,6 +105,7 @@ def test_result_file_round_trips(tmp_path: Path) -> None:
         records=[record],
         agreement=[serving.AgreementRecord("CUSTOM", "w", 16, "FLASH_ATTN", 3, 4)],
         accuracy=[serving.AccuracyRecord("CUSTOM", "gsm8k_5shot_strict", 0.78, 0.011)],
+        kv_cache_dtype="fp8",
     )
     path = serving.write_result(result, tmp_path)
     assert path == tmp_path / "l4" / "serving" / "20261113T221500Z.json"
@@ -128,3 +130,20 @@ def test_the_bench_saves_generated_texts_for_the_agreement_count(tmp_path: Path)
         "m", w, concurrency=16, num_prompts=128, result_dir=tmp_path, result_file="r.json"
     )
     assert "--save-detailed" in cmd
+
+
+def test_an_fp8_run_passes_the_cache_dtype_to_every_server() -> None:
+    plain = serving.serve_command("m", "CUSTOM")
+    fp8 = serving.serve_command("m", "CUSTOM", kv_cache_dtype="fp8")
+    assert "--kv-cache-dtype" not in plain
+    assert fp8[-2:] == ["--kv-cache-dtype", "fp8"] and fp8[:-2] == plain
+
+
+def test_a_version_1_result_reads_as_an_auto_cache() -> None:
+    from pathlib import Path as P
+
+    files = sorted(P("results").glob("*/serving/*.json"))
+    old = [f for f in files if json.loads(f.read_text())["schema_version"] == 1]
+    if not old:
+        pytest.skip("no version 1 serving result in the repository")
+    assert serving.read_result(old[0]).kv_cache_dtype == "auto"
