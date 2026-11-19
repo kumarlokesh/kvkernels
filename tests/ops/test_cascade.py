@@ -16,7 +16,13 @@ pytest.importorskip("triton")
 
 import torch
 
-from kvkernels.ops.cascade import CascadePlan, PrefixGroup, cascade_decode_attention
+import kvkernels.ops.cascade as cascade_module
+from kvkernels.ops.cascade import (
+    CascadePlan,
+    PrefixGroup,
+    cascade_decode_attention,
+    default_prefix_block_m,
+)
 from kvkernels.tolerance import assert_close
 from tests.ops.cascade_cases import DEVICE, INTERPRETING, Case, make_case, make_plan, references
 
@@ -165,6 +171,18 @@ def test_op_is_registered_and_declares_what_it_writes() -> None:
     schema = torch.ops.kvkernels.cascade_decode_attention.default._schema
     written = [a.name for a in schema.arguments if a.alias_info and a.alias_info.is_write]
     assert written == ["workspace", "out", "lse_out"]
+
+
+@pytest.mark.parametrize(
+    ("capability", "head_dim", "rows"),
+    [((7, 5), 128, 64), ((7, 5), 64, 128), ((8, 0), 128, 128), ((8, 9), 128, 128)],
+)
+def test_prefix_tile_is_64_rows_where_128_rows_do_not_fit_in_shared_memory(
+    monkeypatch: pytest.MonkeyPatch, capability: tuple[int, int], head_dim: int, rows: int
+) -> None:
+    monkeypatch.setattr(cascade_module, "_capability", lambda index: capability)
+    assert default_prefix_block_m(torch.device("cuda", 0), head_dim) == rows
+    assert default_prefix_block_m(torch.device("cpu"), head_dim) == 128  # the interpreter
 
 
 # --- GPU tier ---------------------------------------------------------------------

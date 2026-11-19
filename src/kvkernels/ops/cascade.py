@@ -37,6 +37,7 @@ run the same kernel with different tiles:
 
     launch    rows per tile    warps   stages   programs per SM
     prefix    128, 64 or 32    4       2        2                many requests' rows per item
+              (64, 32 or 16 below sm_80 at head_dim 128)
     suffix     16              4       2        2                one request's GQA group per item
 
 Both launches read keys in tiles of 32 tokens (block_n). A prefix task of at
@@ -45,10 +46,13 @@ quarter of the prefix tile; see prefix_attention). A group of at most
 small_item_rows rows (four requests with a GQA group of 4) runs in the suffix
 launch's tiles instead.
 
-With 4 warps each warp holds 32 query rows of a 128-row tile. Compiled for
-sm_89 the prefix launch uses 255 registers per thread, 48 bytes of stack and
-40 KB of shared memory, so two programs fit on an SM; with 64-token key tiles
-it spilled 1 KB per thread. On an L4, against 8 warps, 3 stages and 64-token
+With 4 warps each warp holds 32 query rows of a 128-row tile. Compiled by
+Triton 3.8.0 for sm_89 at head_dim 128 the prefix launch uses 255 registers per
+thread, 24 bytes of stack and 48 KB of shared memory, so two programs fit in an
+L4 SM's 100 KB; with 64-token key tiles it spilled 1 KB per thread. For sm_75
+the same tile needs 80 KB, more than a T4 allows one program, so below compute
+capability 8.0 the prefix tile at head_dim 128 is 64 rows (48 KB) and its
+shorter tiles 32 and 16 rows. On an L4, against 8 warps, 3 stages and 64-token
 key tiles, it took 0.83-0.88x the time at batch 64-128 with prefixes of 8,192
 and more, and 0.97x over the probe grid.
 
@@ -79,6 +83,7 @@ suffixes of 128-2,048 tokens.
 
 from __future__ import annotations
 
+import functools
 import math
 import os
 from collections.abc import Sequence
@@ -134,6 +139,47 @@ class PrefixGroup:
 
 def _interpreting() -> bool:
     return os.environ.get("TRITON_INTERPRET") == "1"
+
+
+# Triton has an e4m3 type only from compute capability 8.9 (L4, RTX 4090, H100).
+FP8_MIN_CAPABILITY = (8, 9)
+
+
+# Compiled by Triton 3.8.0 at head_dim 128, one prefix program with a 128-row
+# tile needs 80 KB of shared memory for sm_75 and 48 KB for sm_89. A T4 (sm_75)
+# allows 64 KB per program, so below SHORT_PREFIX_TILE_BELOW the prefix tile at
+# head_dim 128 is SHORT_PREFIX_TILE rows (48 KB for sm_75).
+SHORT_PREFIX_TILE_BELOW = (8, 0)
+SHORT_PREFIX_TILE = 64
+
+
+@functools.cache
+def _capability(index: int) -> tuple[int, int]:
+    major, minor = torch.cuda.get_device_capability(index)
+    return major, minor
+
+
+def _device_capability(device: torch.device) -> tuple[int, int]:
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    return _capability(index)
+
+
+def fp8_kv_supported(device: torch.device) -> bool:
+    """Whether the cascade can read an fp8 (e4m3) cache on this device."""
+    if device.type != "cuda":
+        return True  # the Triton interpreter
+    return _device_capability(device) >= FP8_MIN_CAPABILITY
+
+
+def default_prefix_block_m(device: torch.device, head_dim: int) -> int:
+    """Rows per prefix tile: 128, or 64 where 128 rows do not fit in shared memory."""
+    if (
+        device.type == "cuda"
+        and head_dim == 128
+        and _device_capability(device) < SHORT_PREFIX_TILE_BELOW
+    ):
+        return SHORT_PREFIX_TILE
+    return 128
 
 
 def same_device(a: torch.device, b: torch.device) -> bool:
@@ -197,7 +243,7 @@ class CascadePlan:
         programs_per_sm: int = 2,
         prefix_programs_per_sm: int = 2,
         min_split_tokens: int = 512,
-        prefix_block_m: int = 128,
+        prefix_block_m: int | None = None,
         prefix_min_block_m: int | None = None,
         suffix_block_m: int = 16,
         block_n: int | None = None,
@@ -218,6 +264,7 @@ class CascadePlan:
             raise ValueError(f"max_levels {max_levels} must be 1 to {MAX_LEVELS}")
         if head_dim not in HEAD_DIMS:
             raise ValueError(f"head_dim must be one of {HEAD_DIMS}, got {head_dim}")
+        prefix_block_m = prefix_block_m or default_prefix_block_m(device, head_dim)
         if prefix_block_m == suffix_block_m:
             raise ValueError("prefix and suffix row tiles must differ in height")
         prefix_min_block_m = prefix_min_block_m or max(16, prefix_block_m // 4)
@@ -812,6 +859,11 @@ def cascade_decode_attention(
         )
     scales: list[torch.Tensor] = []
     if kv_fp8:
+        if not fp8_kv_supported(q.device):
+            raise ValueError(
+                "an fp8 cache needs compute capability 8.9 or later: Triton has no e4m3 type"
+                " below it"
+            )
         for name, given in (("k_scale", k_scale), ("v_scale", v_scale)):
             if given is None or given.numel() != 1 or given.dtype != torch.float32:
                 raise ValueError(f"an fp8 cache needs {name}: a one-element fp32 tensor")

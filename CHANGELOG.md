@@ -42,7 +42,8 @@ The first release.
   position length - query_tokens + t.
 - fp8 (e4m3) K and V, with one K and one V scale per layer
   (`cascade_decode_attention(..., k_scale=, v_scale=)`), as vLLM's and SGLang's
-  default fp8 caches store them.
+  default fp8 caches store them. Needs compute capability 8.9 or later, where
+  Triton has an e4m3 type; below it the op raises a ValueError.
 - `CascadePlan(batch_invariant=True)`: no groups, and split-K by each request's
   length alone, so a request's output does not depend on its batch.
 - `kvkernels.layouts`: the KV cache layouts of vLLM 0.32.0 and SGLang 0.5.22,

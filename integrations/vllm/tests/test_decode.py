@@ -128,6 +128,24 @@ def test_unsupported_lists_every_reason() -> None:
     assert any("96" in r for r in reasons) and any("fp8_e5m2" in r for r in reasons)
 
 
+def test_an_fp8_cache_is_refused_on_a_gpu_without_e4m3() -> None:
+    layer = {
+        "num_heads": 32,
+        "num_kv_heads": 8,
+        "head_size": 128,
+        "kv_cache_dtype": "fp8",
+        "sliding_window": False,
+        "alibi": False,
+        "soft_cap": False,
+        "sinks": False,
+        "decoder": True,
+    }
+    assert unsupported(**layer) == []  # type: ignore[arg-type]
+    reasons = unsupported(**layer, fp8_supported=False)  # type: ignore[arg-type]
+    assert reasons == ["KV cache dtype fp8 on a GPU below compute capability 8.9"]
+    assert unsupported(**{**layer, "kv_cache_dtype": "auto"}, fp8_supported=False) == []  # type: ignore[arg-type]
+
+
 def test_a_plan_larger_than_one_sorting_program_is_refused() -> None:
     with pytest.raises(ValueError, match="max_num_seqs"):
         new_plan(

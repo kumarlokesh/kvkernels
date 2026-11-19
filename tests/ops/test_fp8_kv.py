@@ -18,7 +18,8 @@ pytest.importorskip("triton")
 
 import torch
 
-from kvkernels.ops.cascade import cascade_decode_attention
+from kvkernels.ops import cascade as cascade_module
+from kvkernels.ops.cascade import cascade_decode_attention, fp8_kv_supported
 from tests.ops.cascade_cases import DEVICE, INTERPRETING
 from tests.ops.test_cascade_plan import Setup, explicit_batch, plan_device
 from tests.ops.test_tree_attention import attend, build, check, new_plan, tree_batch
@@ -26,6 +27,10 @@ from tests.ops.test_tree_attention import attend, build, check, new_plan, tree_b
 pytestmark = pytest.mark.skipif(
     not INTERPRETING and not torch.cuda.is_available(),
     reason="needs the Triton interpreter or a CUDA GPU",
+)
+needs_e4m3 = pytest.mark.skipif(
+    not fp8_kv_supported(torch.device(DEVICE)),
+    reason="Triton has no e4m3 type below compute capability 8.9",
 )
 
 E4M3_MAX = 448.0
@@ -72,6 +77,7 @@ def attend_fp8(
         ("sglang_nhd", 1, torch.float16),
     ],
 )
+@needs_e4m3
 def test_fp8_equals_the_dequantized_cache_bit_for_bit(
     layout: str, query_tokens: int, dtype: torch.dtype
 ) -> None:
@@ -94,6 +100,7 @@ def test_fp8_equals_the_dequantized_cache_bit_for_bit(
     check(setup, out8, lse8, query_tokens=query_tokens)
 
 
+@needs_e4m3
 def test_scales_that_are_not_powers_of_two() -> None:
     # The dequantized values are not exact in fp16 here; the fp8 result must
     # still match the fp32 reference over K · k_scale and V · v_scale.
@@ -115,6 +122,7 @@ def test_scales_that_are_not_powers_of_two() -> None:
     assert float((out8.float() - out32).abs().max()) < 4e-3
 
 
+@needs_e4m3
 def test_fp8_needs_both_scales_and_an_fp8_view() -> None:
     batch = explicit_batch([[1, 2], [1, 3]], [8, 8], 4)
     setup = build(batch)
@@ -128,3 +136,27 @@ def test_fp8_needs_both_scales_and_an_fp8_view() -> None:
         cascade_decode_attention(setup.q, k8.view(torch.uint8), v8.view(torch.uint8), plan, out)
     with pytest.raises(ValueError, match="float8_e4m3fn"):
         cascade_decode_attention(setup.q, k8, setup.v, plan, out, k_scale=ks, v_scale=ks)
+
+
+@pytest.mark.parametrize(
+    ("capability", "supported"), [((7, 5), False), ((8, 0), False), ((8, 9), True), ((9, 0), True)]
+)
+def test_fp8_needs_compute_capability_8_9(
+    monkeypatch: pytest.MonkeyPatch, capability: tuple[int, int], supported: bool
+) -> None:
+    monkeypatch.setattr(cascade_module, "_capability", lambda index: capability)
+    assert fp8_kv_supported(torch.device("cuda", 0)) is supported
+    assert fp8_kv_supported(torch.device("cpu"))  # the interpreter
+
+
+def test_an_fp8_cache_is_refused_where_triton_has_no_e4m3(monkeypatch: pytest.MonkeyPatch) -> None:
+    batch = explicit_batch([[1, 2], [1, 3]], [8, 8], 4)
+    setup = build(batch)
+    setup, k8, v8, ks, vs = fp8_setup(setup)
+    plan = new_plan(setup, batch)
+    plan_device(plan, setup)
+    monkeypatch.setattr(cascade_module, "fp8_kv_supported", lambda device: False)
+    with pytest.raises(ValueError, match=r"compute capability 8\.9"):
+        cascade_decode_attention(
+            setup.q, k8, v8, plan, torch.empty_like(setup.q), k_scale=ks, v_scale=vs
+        )

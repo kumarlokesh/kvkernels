@@ -41,7 +41,7 @@ from vllm.v1.attention.backends.triton_attn import (
 )
 from vllm.v1.attention.backends.utils import split_decodes_and_prefills
 
-from kvkernels.ops.cascade import CascadePlan
+from kvkernels.ops.cascade import CascadePlan, fp8_kv_supported
 from kvkernels_vllm.decode import HEAD_SIZES, check_decode, decode, new_plan, unsupported
 
 CHECK_ENV = "KVKERNELS_VLLM_CHECK"
@@ -172,6 +172,8 @@ class KvkernelsAttentionImpl(TritonAttentionImpl):
             soft_cap=bool(self.logits_soft_cap),
             sinks=self.sinks is not None,
             decoder=self.attn_type == AttentionType.DECODER,
+            # Without a GPU the ops run under the Triton interpreter, which has e4m3.
+            fp8_supported=not torch.cuda.is_available() or fp8_kv_supported(torch.device("cuda")),
         )
         if reasons:
             raise ValueError("the kvkernels backend does not support: " + "; ".join(reasons))

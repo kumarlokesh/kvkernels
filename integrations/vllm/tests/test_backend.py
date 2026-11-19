@@ -252,6 +252,8 @@ def test_every_decode_call_matches_vllm_and_fp32_in_a_server_step(
 
     import kvkernels.ops.cascade
 
+    if kv_cache_dtype == "fp8" and not kvkernels.ops.cascade.fp8_kv_supported(torch.device("cuda")):
+        pytest.skip("Triton has no e4m3 type below compute capability 8.9")
     monkeypatch.setenv("KVKERNELS_VLLM_CHECK", "1")
     monkeypatch.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
     # The system prompt is about 150 tokens; group it despite the 512-token default.

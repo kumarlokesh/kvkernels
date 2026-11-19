@@ -56,8 +56,12 @@ def unsupported(
     soft_cap: bool,
     sinks: bool,
     decoder: bool,
+    fp8_supported: bool = True,
 ) -> list[str]:
-    """Reasons the cascade cannot serve a layer; empty when it can."""
+    """Reasons the cascade cannot serve a layer; empty when it can.
+
+    fp8_supported: whether the GPU can run the cascade on an fp8 cache.
+    """
     reasons = []
     if head_size not in HEAD_SIZES:
         reasons.append(f"head size {head_size} (supported: {HEAD_SIZES})")
@@ -65,6 +69,8 @@ def unsupported(
         reasons.append(f"{num_heads} query heads over {num_kv_heads} KV heads")
     if kv_cache_dtype not in KV_DTYPES:
         reasons.append(f"KV cache dtype {kv_cache_dtype}")
+    elif kv_cache_dtype.startswith("fp8") and not fp8_supported:
+        reasons.append(f"KV cache dtype {kv_cache_dtype} on a GPU below compute capability 8.9")
     for flag, name in (
         (sliding_window, "sliding window"),
         (alibi, "ALiBi"),

@@ -109,7 +109,9 @@ On a NVIDIA L4, vLLM 0.33.0 serving Llama-3.1-8B-Instruct with an fp8 KV cache a
 - On the T4, Triton uses no tensor cores, so the attention ops are correct but
   slower than FlashInfer there.
 - Decode only; no prefill kernels.
-- fp8 KV is e4m3 with one scale for K and one for V per layer.
+- fp8 KV is e4m3 with one scale for K and one for V per layer, and needs
+  compute capability 8.9 or later (L4, RTX 4090, H100): Triton has no e4m3
+  type below it.
 - The vLLM backend supports vLLM 0.33.0 only and installs from this repository.
 - Outside a CUDA graph, each call costs tens of microseconds of CPU time.
 
