@@ -12,8 +12,9 @@ vllm serve meta-llama/Llama-3.1-8B-Instruct --attention-backend CUSTOM
 
 The backend refuses, at startup, models and settings the cascade does not
 support: head sizes other than 64 and 128, more than 16 query heads per KV head,
-fp8 KV, sliding windows, ALiBi, logit soft caps, attention sinks, speculative
-decoding.
+sliding windows, ALiBi, logit soft caps, attention sinks, speculative decoding.
+An fp8 KV cache (`--kv-cache-dtype fp8` or `fp8_e4m3`) is supported; the query
+stays in the model's dtype.
 
 `KVKERNELS_VLLM_CHECK=1` with `--enforce-eager` also runs vLLM's Triton kernel
 and an fp32 reference on every decode call, and fails on a mismatch.

@@ -41,6 +41,13 @@ plan.plan_from_block_table(block_table, seq_lens)   # each step, on the GPU: fin
 cascade_decode_attention(q, k, v, plan, out)        # each layer
 ```
 
+The plan finds shared prefixes on the GPU from the engine's block table or slot
+list, so a decode step stays one CUDA graph. Prefixes may nest (a system prompt
+shared by every request, a document shared by some), a request may bring up to
+16 new tokens (speculative decoding), and K and V may be fp16, bf16 or fp8.
+A `PlaneSet` gathers or scatters the same KV blocks in every layer's K and V
+in one launch, to or from pinned host memory.
+
 Runnable versions: [examples/gather.py](examples/gather.py),
 [examples/cascade.py](examples/cascade.py). Every op writes into tensors the
 caller provides, can be captured in a CUDA graph, and has a PyTorch reference in
@@ -70,25 +77,40 @@ On a Tesla T4, kvkernels gathers 512 KV blocks from vLLM's default layout at 223
 ### Cascade decode attention
 
 <!-- results:cascade:begin -->
-One decode step of one layer: Llama 3.1 8B attention (32 query heads, 8 KV heads, head_dim 128), one shared prefix of 8,192 tokens, a 512-token suffix per request, vLLM's layout with 16-token KV blocks, fp16. Median time; bandwidth counts the bytes a cascade needs (the prefix read once).
+On a NVIDIA L4, one layer of Llama 3.1 8B decodes 64 requests that share an 8,192-token prefix in 769 µs with kvkernels (FlashInfer's decode 2373 µs, FlashInfer's cascade 716 µs).
 
-| Batch | kvkernels (µs) | FlashInfer decode (µs) | FlashInfer cascade (µs) | speedup over FlashInfer decode | kvkernels, share of datasheet bandwidth |
-|---|---|---|---|---|---|
-| 1 | 146.4 | 151.6 | 165.9 | 1.03x | 81% |
-| 4 | 179.2 | 181.2 | 193.5 | 1.01x | 78% |
-| 16 | 288.8 | 605.2 | 292.9 | 2.10x | 77% |
-| 32 | 486.4 | 1267.7 | 434.2 | 2.61x | 69% |
-| 64 | 769.0 | 2373.1 | 715.8 | 3.09x | 73% |
-| 128 | 1493.0 | 5056.5 | 1402.9 | 3.39x | 67% |
+<picture><source media="(prefers-color-scheme: dark)" srcset="figures/l4/cascade-dark.svg"><img alt="One layer, 64 requests sharing 8,192 tokens, on a NVIDIA L4" src="figures/l4/cascade-light.svg" width="720"></picture>
 
 <sub>NVIDIA L4, torch 2.14.1+cu126, Triton 3.8.0, commit <code>dirty-78a1d416</code>; from <code>results/l4/cascade/20261118T213405Z.json</code></sub>
 <!-- results:cascade:end -->
 
+### Serving in vLLM
+
+The cascade as vLLM's decode attention backend, through the plugin in
+[integrations/vllm](integrations/vllm), measured with vLLM's serving benchmark
+and GSM8K.
+
+<!-- results:serving:begin -->
+On a NVIDIA L4, vLLM 0.33.0 serving Llama-3.1-8B-Instruct with a KV cache in the model's dtype and kvkernels for decode attention produces 666 output tokens/s when 64 requests share an 8,192-token document (+49% over vLLM Triton, +86% over FlashAttention). With nothing shared it is within 0.6% of vLLM's backends; GSM8K kvkernels 70.4%, vLLM Triton 70.1%, FlashAttention 70.6%.
+
+<picture><source media="(prefers-color-scheme: dark)" srcset="figures/l4/serving-dark.svg"><img alt="Output tokens/s, 64 requests sharing 8,192 tokens, on a NVIDIA L4" src="figures/l4/serving-light.svg" width="720"></picture>
+
+<sub>NVIDIA L4, torch 2.14.0+cu130, Triton 3.8.0, commit <code>dirty-d2c71359</code>; from <code>results/l4/serving/20261117T224727Z.json</code></sub>
+
+On a NVIDIA L4, vLLM 0.33.0 serving Llama-3.1-8B-Instruct with an fp8 KV cache and kvkernels for decode attention produces 680 output tokens/s when 64 requests share an 8,192-token document (+38% over vLLM Triton). With nothing shared it is within 1.2% of vLLM's backends; GSM8K kvkernels 71.0%, vLLM Triton 69.8%.
+
+<sub>NVIDIA L4, torch 2.14.0+cu130, Triton 3.8.0, commit <code>dirty-78a1d416</code>; from <code>results/l4/serving/20261118T233456Z.json</code></sub>
+<!-- results:serving:end -->
+
 ## Limitations
 
-- On the T4 (compute capability 7.5), Triton uses no tensor cores, so the
-  attention ops are correct but slower than FlashInfer there.
+- Tested on the T4 (compute capability 7.5) and L4 (8.9). The A100 (8.0) and
+  H100 (9.0) are supported but have not run the tests.
+- On the T4, Triton uses no tensor cores, so the attention ops are correct but
+  slower than FlashInfer there.
 - Decode only; no prefill kernels.
+- fp8 KV is e4m3 with one scale for K and one for V per layer.
+- The vLLM backend supports vLLM 0.33.0 only and installs from this repository.
 - Outside a CUDA graph, each call costs tens of microseconds of CPU time.
 
 ## Development

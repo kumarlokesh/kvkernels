@@ -65,9 +65,12 @@ its cap that makes ceil(base · s / R) / s smallest, ties to the smaller:
                        s = 7: 2 rounds     2/7 = 0.29   ◀ chosen
 
 A launch with base >= R fills a round already and is not split: more ranges
-would add partial results for the merge to read. The cap is MAX_SPLITS and
-ceil(length / shortest range), with the shortest range
-clamp(SPLIT_TOKENS_PER_ROW · tile rows, MIN_SPLIT_FLOOR, min_split_tokens).
+would add partial results for the merge to read. The cap is the smallest of
+MAX_SPLITS, ceil(length / shortest range), with the shortest range
+clamp(SPLIT_TOKENS_PER_ROW · tile rows, MIN_SPLIT_FLOOR, min_split_tokens),
+and the larger of two bounds on the item's partial results: no larger than its
+K and V (length / (SPLIT_TOKENS_PER_ROW · rows)), or within a third of L2
+(part_budget_rows / rows).
 On an L4 over 144 cases (batch 1-128, prefix 512-32,768, both models) the
 round rule took 0.935x the time of the earlier one (ceil(2 SMs / base) ranges
 of at least 512 tokens); the guard took a further 0.99x over 72 cases with
@@ -146,7 +149,35 @@ def same_device(a: torch.device, b: torch.device) -> bool:
 
 
 class CascadePlan:
-    """Work items, split-K ranges and merge lists for one decode step, in fixed device buffers."""
+    """Work items, split-K ranges and merge lists for one decode step, in fixed device buffers.
+
+    Build one plan per model (one shape of attention) and maximum batch, fill it
+    once per decode step with plan_from_block_table, plan_from_slots or update,
+    and pass it to cascade_decode_attention for every layer.
+
+    Sizes, fixed for the plan's life:
+        max_requests: the largest batch; at most 4,096 for planning on the GPU.
+        max_groups: the most prefix-tree nodes a step may have. Planning on the
+            GPU folds nodes past it into their children, which read those
+            tokens themselves.
+        max_blocks: the most KV block ids a host plan (update) may list.
+        num_q_heads, num_kv_heads, head_dim: the attention shape; head_dim 64
+            or 128, and at most 16 query heads per KV head.
+        block_size, num_blocks: tokens per KV block and KV blocks in the cache.
+        device: where the plan's buffers live.
+        max_tasks, max_parts: workspace sizes; the defaults fit any plan.
+    Behaviour:
+        min_shared_tokens: the fewest tokens a group of requests must share to
+            be read once for all of them (default 512).
+        batch_invariant: no groups, and split-K by each request's length alone,
+            so a request's output does not depend on the rest of its batch.
+        query_tokens: new tokens per request, 1 to 16 (more than 1 for
+            speculative decoding's verification step).
+        max_levels: levels of shared prefix planning on the GPU looks for, 1
+            to 8 (default 4).
+    The other arguments tune tiles and split-K for a GPU; their defaults come
+    from L4 measurements, and a release may change or remove them.
+    """
 
     def __init__(
         self,

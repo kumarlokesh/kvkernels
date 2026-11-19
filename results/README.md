@@ -39,3 +39,47 @@ One decode step of one layer: Llama 3.1 8B attention (32 query heads, 8 KV heads
 | 128 | 1493.0 | 5056.5 | 1402.9 | 3.39x | 67% |
 
 <sub>NVIDIA L4, torch 2.14.1+cu126, Triton 3.8.0, commit <code>dirty-78a1d416</code>; from <code>results/l4/cascade/20261118T213405Z.json</code></sub>
+
+## Serving in vLLM
+
+vLLM 0.33.0 serving Llama-3.1-8B-Instruct, KV cache dtype auto: kvkernels as the decode attention backend against vLLM's own backends. Output tokens per second.
+
+| Workload | Concurrency | kvkernels (tok/s) | vLLM Triton (tok/s) | FlashAttention (tok/s) | kvkernels against vLLM Triton | kvkernels against FlashAttention |
+|---|---|---|---|---|---|---|
+| long document: 8,192 shared tokens | 16 | 220 | 186 | 170 | +18.2% | +29.4% |
+| long document: 8,192 shared tokens | 32 | 385 | 291 | 258 | +32.1% | +49.1% |
+| long document: 8,192 shared tokens | 64 | 666 | 447 | 358 | +49.2% | +85.9% |
+| system prompt: 2,048 shared tokens | 16 | 232 | 222 | 218 | +4.6% | +6.6% |
+| system prompt: 2,048 shared tokens | 32 | 402 | 373 | 368 | +7.6% | +9.2% |
+| system prompt: 2,048 shared tokens | 64 | 699 | 629 | 606 | +11.1% | +15.4% |
+| few-shot: 4 prompts of 1,024 tokens | 16 | 227 | 227 | 226 | +0.0% | +0.4% |
+| few-shot: 4 prompts of 1,024 tokens | 32 | 396 | 390 | 388 | +1.5% | +2.2% |
+| few-shot: 4 prompts of 1,024 tokens | 64 | 695 | 677 | 663 | +2.7% | +4.8% |
+| control: nothing shared | 16 | 240 | 239 | 240 | +0.3% | +0.3% |
+| control: nothing shared | 32 | 419 | 421 | 420 | -0.6% | -0.2% |
+| control: nothing shared | 64 | 744 | 748 | 743 | -0.5% | +0.1% |
+
+GSM8K 5-shot, strict match: kvkernels 70.4% ± 1.3%, vLLM Triton 70.1% ± 1.3%, FlashAttention 70.6% ± 1.3%.
+
+<sub>NVIDIA L4, torch 2.14.0+cu130, Triton 3.8.0, commit <code>dirty-d2c71359</code>; from <code>results/l4/serving/20261117T224727Z.json</code></sub>
+
+vLLM 0.33.0 serving Llama-3.1-8B-Instruct, KV cache dtype fp8: kvkernels as the decode attention backend against vLLM's own backends. Output tokens per second.
+
+| Workload | Concurrency | kvkernels (tok/s) | vLLM Triton (tok/s) | kvkernels against vLLM Triton |
+|---|---|---|---|---|
+| long document: 8,192 shared tokens | 16 | 227 | 199 | +13.9% |
+| long document: 8,192 shared tokens | 32 | 401 | 319 | +25.9% |
+| long document: 8,192 shared tokens | 64 | 680 | 494 | +37.5% |
+| system prompt: 2,048 shared tokens | 16 | 236 | 229 | +3.2% |
+| system prompt: 2,048 shared tokens | 32 | 413 | 398 | +3.7% |
+| system prompt: 2,048 shared tokens | 64 | 731 | 686 | +6.5% |
+| few-shot: 4 prompts of 1,024 tokens | 16 | 232 | 233 | -0.4% |
+| few-shot: 4 prompts of 1,024 tokens | 32 | 410 | 407 | +0.8% |
+| few-shot: 4 prompts of 1,024 tokens | 64 | 734 | 727 | +0.9% |
+| control: nothing shared | 16 | 244 | 243 | +0.5% |
+| control: nothing shared | 32 | 441 | 442 | -0.2% |
+| control: nothing shared | 64 | 772 | 781 | -1.2% |
+
+GSM8K 5-shot, strict match: kvkernels 71.0% ± 1.3%, vLLM Triton 69.8% ± 1.3%.
+
+<sub>NVIDIA L4, torch 2.14.0+cu130, Triton 3.8.0, commit <code>dirty-78a1d416</code>; from <code>results/l4/serving/20261118T233456Z.json</code></sub>

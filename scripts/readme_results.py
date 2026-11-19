@@ -11,8 +11,10 @@ For each suite and GPU, from the newest file in results/<gpu>/<suite>/:
     results/README.md                                       the full table, and the file,
                                                             GPU, torch, Triton and commit
 
-Each chart and table comes from one result file, so numbers from different runs
-never share one. Text outside the markers is left alone.
+The serving suite takes the newest file for each KV cache dtype instead, since
+a run with an fp8 cache compares fewer backends. Each chart and table comes from
+one result file, so numbers from different runs never share one. Text outside
+the markers is left alone.
 """
 
 from __future__ import annotations
@@ -80,6 +82,21 @@ CASCADE_IMPLS = {
     "flashinfer_decode": "FlashInfer decode",
     "flashinfer_cascade": "FlashInfer cascade",
 }
+CASCADE_CHART_BATCH = 64  # the batch the chart and summary show
+
+SERVING_BACKENDS = {  # vLLM's names, kvkernels first
+    "CUSTOM": "kvkernels",
+    "TRITON_ATTN": "vLLM Triton",
+    "FLASH_ATTN": "FlashAttention",
+}
+SERVING_WORKLOADS = {
+    "long_document": "long document: 8,192 shared tokens",
+    "shared_system_prompt": "system prompt: 2,048 shared tokens",
+    "few_shot_4": "few-shot: 4 prompts of 1,024 tokens",
+    "control": "control: nothing shared",
+}
+SERVING_HEADLINE = "long_document"  # the workload the chart and summary show
+SERVING_CONTROL = "control"
 
 
 def newest_results(results: Path, suite: str) -> list[Path]:
@@ -89,6 +106,21 @@ def newest_results(results: Path, suite: str) -> list[Path]:
         files = sorted((gpu / suite).glob("*.json"))
         if files:
             newest.append(files[-1])
+    return newest
+
+
+def kv_cache_dtype(result: Result) -> str:
+    return str(result.get("kv_cache_dtype", "auto"))  # schema 1 files predate the field
+
+
+def newest_serving(results: Path, suite: str) -> list[Path]:
+    """The newest serving file for each GPU and KV cache dtype; the default dtype first."""
+    newest = []
+    for gpu in sorted(p for p in results.iterdir() if p.is_dir()) if results.is_dir() else []:
+        by_dtype: dict[str, Path] = {}
+        for path in sorted((gpu / suite).glob("*.json")):
+            by_dtype[kv_cache_dtype(json.loads(path.read_text()))] = path
+        newest += [by_dtype[d] for d in sorted(by_dtype, key=lambda d: (d != "auto", d))]
     return newest
 
 
@@ -292,7 +324,137 @@ BASELINE_SUMMARY = {"index_select", "vLLM copy kernel", "cuMemcpyBatchAsync"}
 
 def cascade_section(result: Result) -> Section | None:
     table_lines = cascade_table(result)
-    return None if table_lines is None else Section(table_lines, table_lines, {})
+    if table_lines is None:
+        return None
+    batch = CASCADE_CHART_BATCH
+    found = {impl: find(result, impl, {**CASCADE_ROW, "batch": batch}) for impl in CASCADE_IMPLS}
+    ours = found["kvkernels"]
+    if ours is None:
+        return Section(table_lines, table_lines, {})
+    gpu, gpu_name = result["env"]["gpu_slug"], result["env"]["gpu_name"]
+    bars = [(CASCADE_IMPLS[impl], m["median_ms"] * 1e3) for impl, m in found.items() if m]
+    title = f"One layer, {batch} requests sharing 8,192 tokens, on a {gpu_name}"
+    charts = bar_chart(bars, None, title, "µs")
+    paths = {theme: f"figures/{gpu}/cascade-{theme}.svg" for theme in charts}
+    summary = (
+        f"On a {gpu_name}, one layer of Llama 3.1 8B decodes {batch} requests that share an"
+        f" 8,192-token prefix in {ours['median_ms'] * 1e3:.0f} µs with kvkernels"
+    )
+    others = [
+        f"FlashInfer's {name.split()[-1]} {m['median_ms'] * 1e3:.0f} µs"
+        for impl, m in found.items()
+        if m and impl != "kvkernels"
+        for name in [CASCADE_IMPLS[impl]]
+    ]
+    if others:
+        summary += " (" + ", ".join(others) + ")"
+    lines = [summary + ".", "", picture(paths["light"], paths["dark"], title)]
+    return Section(lines, table_lines, {paths[theme]: svg for theme, svg in charts.items()})
+
+
+def serving_records(result: Result) -> dict[tuple[str, int, str], dict[str, Any]]:
+    return {(r["workload"], r["concurrency"], r["backend"]): r for r in result["records"]}
+
+
+def gain(ours: dict[str, Any], other: dict[str, Any]) -> float:
+    return float(ours["output_throughput"]) / float(other["output_throughput"]) - 1
+
+
+def serving_table(result: Result) -> list[str]:
+    records = serving_records(result)
+    backends = [b for b in SERVING_BACKENDS if any(k[2] == b for k in records)]
+    others = [b for b in backends if b != "CUSTOM"]
+    rows = []
+    for workload, name in SERVING_WORKLOADS.items():
+        for c in sorted({k[1] for k in records if k[0] == workload}):
+            cells = [name, str(c)]
+            for b in backends:
+                r = records.get((workload, c, b))
+                cells.append(MISSING if r is None else f"{r['output_throughput']:.0f}")
+            ours = records.get((workload, c, "CUSTOM"))
+            for b in others:
+                r = records.get((workload, c, b))
+                cells.append(MISSING if ours is None or r is None else f"{gain(ours, r):+.1%}")
+            rows.append(cells)
+    header = [
+        "Workload",
+        "Concurrency",
+        *(f"{SERVING_BACKENDS[b]} (tok/s)" for b in backends),
+        *(f"kvkernels against {SERVING_BACKENDS[b]}" for b in others),
+    ]
+    accuracy = sorted(
+        result.get("accuracy", []), key=lambda a: list(SERVING_BACKENDS).index(a["backend"])
+    )
+    lines = [
+        f"vLLM {result['engine_version']} serving {result['model'].split('/')[-1]}, KV cache"
+        f" dtype {kv_cache_dtype(result)}: kvkernels as the decode attention backend against"
+        " vLLM's own backends. Output tokens per second.",
+        "",
+        *table(header, rows),
+    ]
+    if accuracy:
+        lines += [
+            "",
+            "GSM8K 5-shot, strict match: "
+            + ", ".join(
+                f"{SERVING_BACKENDS[a['backend']]} {a['accuracy']:.1%} ± {a['stderr']:.1%}"
+                for a in accuracy
+            )
+            + ".",
+        ]
+    return lines
+
+
+def serving_section(result: Result) -> Section | None:
+    records = serving_records(result)
+    concurrencies = sorted({k[1] for k in records if k[0] == SERVING_HEADLINE})
+    if not concurrencies or not any(k[2] == "CUSTOM" for k in records):
+        return None
+    table_lines = serving_table(result)
+    top = concurrencies[-1]
+    found = {b: records.get((SERVING_HEADLINE, top, b)) for b in SERVING_BACKENDS}
+    ours = found["CUSTOM"]
+    if ours is None:
+        return Section([], table_lines, {})
+    gpu, gpu_name, dtype = (
+        result["env"]["gpu_slug"],
+        result["env"]["gpu_name"],
+        kv_cache_dtype(result),
+    )
+    cache = "an fp8 KV cache" if dtype.startswith("fp8") else "a KV cache in the model's dtype"
+    gains = [
+        f"{gain(ours, r):+.0%} over {SERVING_BACKENDS[b]}"
+        for b, r in found.items()
+        if r is not None and b != "CUSTOM"
+    ]
+    summary = (
+        f"On a {gpu_name}, vLLM {result['engine_version']} serving"
+        f" {result['model'].split('/')[-1]} with {cache} and kvkernels for decode"
+        f" attention produces {ours['output_throughput']:.0f} output tokens/s when {top}"
+        f" requests share an 8,192-token document ({', '.join(gains)})"
+    )
+    control = [
+        abs(gain(records[(SERVING_CONTROL, c, "CUSTOM")], records[(SERVING_CONTROL, c, b)]))
+        for (w, c, b) in records
+        if w == SERVING_CONTROL and b != "CUSTOM" and (SERVING_CONTROL, c, "CUSTOM") in records
+    ]
+    if control:
+        summary += f". With nothing shared it is within {max(control):.1%} of vLLM's backends"
+    accuracy = {a["backend"]: a["accuracy"] for a in result.get("accuracy", [])}
+    if "CUSTOM" in accuracy:
+        summary += "; GSM8K " + ", ".join(
+            f"{SERVING_BACKENDS[b]} {accuracy[b]:.1%}" for b in SERVING_BACKENDS if b in accuracy
+        )
+    lines = [summary + "."]
+    figures: Files = {}
+    if dtype == "auto":
+        bars = [(SERVING_BACKENDS[b], float(r["output_throughput"])) for b, r in found.items() if r]
+        title = f"Output tokens/s, {top} requests sharing 8,192 tokens, on a {gpu_name}"
+        charts = bar_chart(bars, None, title, "tok/s")
+        paths = {theme: f"figures/{gpu}/serving-{theme}.svg" for theme in charts}
+        lines += ["", picture(paths["light"], paths["dark"], title)]
+        figures = {paths[theme]: svg for theme, svg in charts.items()}
+    return Section(lines, table_lines, figures)
 
 
 def kv_gather_table(result: Result) -> list[str] | None:
@@ -362,7 +524,9 @@ def cascade_table(result: Result) -> list[str] | None:
 SECTIONS: dict[str, tuple[str, Callable[[Result], Section | None]]] = {
     "kv_gather": ("KV block gather", kv_gather_section),
     "cascade": ("Cascade decode attention", cascade_section),
+    "serving": ("Serving in vLLM", serving_section),
 }
+PICK_FILES: dict[str, Callable[[Path, str], list[Path]]] = {"serving": newest_serving}
 TABLES_PATH = "results/README.md"
 TABLES_HEADER = """# Results
 
@@ -382,7 +546,7 @@ def render(readme: str, results: Path, root: Path) -> tuple[str, Files]:
             raise ValueError(f"README has no {begin} … {end} markers")
         parts = []
         tables.append(f"## {heading}\n")
-        for path in newest_results(results, suite):
+        for path in PICK_FILES.get(suite, newest_results)(results, suite):
             result = json.loads(path.read_text())
             made = make(result)
             if made is None:
