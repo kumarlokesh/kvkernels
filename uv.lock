@@ -1090,7 +1090,7 @@ wheels = [
 
 [[package]]
 name = "kvkernels"
-version = "0.0.0"
+version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "torch", version = "2.14.1", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "(sys_platform == 'darwin' and extra == 'extra-9-kvkernels-cpu') or (extra == 'extra-9-kvkernels-cpu' and extra == 'extra-9-kvkernels-cu126') or (extra == 'extra-9-kvkernels-cpu' and extra == 'extra-9-kvkernels-cu130') or (extra == 'extra-9-kvkernels-cu126' and extra == 'extra-9-kvkernels-cu130')" },

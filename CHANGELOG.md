@@ -9,6 +9,8 @@ passed on the released source, with the torch and Triton versions of that run.
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-11-20
+
 The first release.
 
 ### Added
@@ -52,3 +54,5 @@ The first release.
 - Support for torch 2.13 and later and Triton 3.7 and later, on Python 3.11 and
   later, on NVIDIA GPUs of compute capability 7.5 to 9.0. The cascade needs q,
   K and V with a contiguous head dimension, which every supported layout has.
+
+Tested on: NVIDIA L4 and T4, each with torch 2.14.1 / Triton 3.8.0 and torch 2.13.0 / Triton 3.7.1.
